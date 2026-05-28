@@ -89,6 +89,13 @@ def _pts(val):
     return 0
 
 
+def _fmt_time(hours: float) -> str:
+    """Formata horas como '48h (6d)' para facil leitura. Ex: 39.0 -> '39h (4.9d)'."""
+    if not hours:
+        return "—"
+    return f"{round(hours)}h ({round(hours / 8, 1)}d)"
+
+
 # ---------------------------------------------------------------------------
 # Time in status + risco de atraso
 # ---------------------------------------------------------------------------
@@ -479,23 +486,44 @@ def get_sprint_stories_detail(board_id: int, sprint_id: int = None,
         # Label amigavel para Em Testes
         status_label = "Em Testes (dev concluido)" if status.lower() == "em testes" else status
 
+        hours_in_status = time_data["time_in_current_status_days"] * 8
+        orig_h  = sub_agg["original_estimate_h"] if sub_agg["total_subtasks"] > 0 \
+                  else time_data["original_estimate_hours"]
+        spent_h = sub_agg["time_spent_h"] if sub_agg["total_subtasks"] > 0 \
+                  else time_data["time_spent_hours"]
+        rem_h   = sub_agg["remaining_h"] if sub_agg["total_subtasks"] > 0 \
+                  else time_data["remaining_hours"]
+
+        # Overrun da historia: (gasto + restante) vs estimativa original
+        if orig_h > 0 and (spent_h + rem_h) > 0:
+            proj = spent_h + rem_h if rem_h > 0 else spent_h
+            overrun_pct = round((proj / orig_h - 1) * 100)
+            story_overrun = f"+{overrun_pct}%" if overrun_pct > 0 else (
+                f"{overrun_pct}%" if overrun_pct < 0 else "0%"
+            )
+        else:
+            story_overrun = "—"
+
         results.append({
-            "key":              s["key"],
-            "summary":          f.get("summary", "")[:80],
-            "status":           status_label,
-            "assignee":         assignee,
-            "days_in_status":   time_data["time_in_current_status_days"],
-            "subtasks_total":   sub_agg["total_subtasks"],
-            "original_estimate_h": sub_agg["original_estimate_h"] if sub_agg["total_subtasks"] > 0
-                                   else time_data["original_estimate_hours"],
-            "spent_h":          sub_agg["time_spent_h"] if sub_agg["total_subtasks"] > 0
-                                else time_data["time_spent_hours"],
-            "remaining_h":      sub_agg["remaining_h"] if sub_agg["total_subtasks"] > 0
-                                else time_data["remaining_hours"],
-            "risk":             risk["nivel"],
-            "risk_detail":      risk.get("fatores", []),
-            "subtasks_overdue": sub_agg["overdue_subtasks"],
-            "status_history":   time_data["status_history"],
+            "key":               s["key"],
+            "summary":           f.get("summary", "")[:80],
+            "status":            status_label,
+            "assignee":          assignee,
+            "subtasks_total":    sub_agg["total_subtasks"],
+            # Tempo no status atual formatado
+            "tempo_no_status":   _fmt_time(hours_in_status),
+            "tempo_no_status_h": round(hours_in_status, 1),
+            "tempo_no_status_d": time_data["time_in_current_status_days"],
+            # Estimativas formatadas
+            "estimativa_original": _fmt_time(orig_h),
+            "gasto":             _fmt_time(spent_h),
+            "restante":          _fmt_time(rem_h),
+            "overrun":           story_overrun,
+            # Risco
+            "risk":              risk["nivel"],
+            "risk_detail":       risk.get("fatores", []),
+            "subtasks_overdue":  sub_agg["overdue_subtasks"],
+            "status_history":    time_data["status_history"],
         })
 
     return sorted(results, key=lambda x: (
