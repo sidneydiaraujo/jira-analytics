@@ -14,9 +14,10 @@ JIRA_AGILE = "https://qx3prod.atlassian.net/rest/agile/1.0"
 PROJECTS   = ["TPROJ", "TNP", "TLIGHTDIST", "TLIGHTCOM", "THP",
               "TTRD", "TSRV", "PROJTHUN", "SUP", "TVAR"]
 
-# Status que indicam trabalho ativo (para calcular risco de atraso)
+# Status que indicam trabalho ativo (para calcular risco de atraso).
+# "Em Testes" NAO esta aqui — significa desenvolvimento concluido neste contexto.
 IN_PROGRESS_STATUSES = {"em andamento", "in progress", "doing", "em desenvolvimento",
-                        "em analise", "em análise", "development", "em testes", "in review"}
+                        "em analise", "em análise", "development", "in review"}
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +373,64 @@ def get_sprint_report(board_id: int, sprint_id: int = None):
     }
 
 
+def _get_subtask_aggregate(story_key: str) -> dict:
+    """Agrega tempo de todas as subtarefas de uma historia.
+
+    O time registra horas nas subtarefas, nao na historia pai.
+    Retorna totais de estimativa/gasto/restante e lista de subtarefas com tempo excedido.
+    """
+    subtasks = _search(
+        f"parent = {story_key}",
+        "summary,status,timeoriginalestimate,timespent,timeestimate",
+        max_results=100
+    )
+
+    total_orig = total_spent = total_rem = 0
+    overdue = []
+
+    for st in subtasks:
+        f    = st["fields"]
+        orig  = _hours(f.get("timeoriginalestimate") or 0)
+        spent = _hours(f.get("timespent") or 0)
+        rem   = _hours(f.get("timeestimate") or 0)
+        cat   = f["status"]["statusCategory"]["key"]
+
+        total_orig  += orig
+        total_spent += spent
+        total_rem   += rem
+
+        # Subtarefa que ultrapassou a estimativa
+        if orig > 0 and spent > orig * 1.2:
+            overrun_pct = round((spent / orig - 1) * 100)
+            overdue.append({
+                "key":        st["key"],
+                "summary":    f.get("summary", "")[:60],
+                "status":     f["status"]["name"],
+                "original_h": orig,
+                "spent_h":    spent,
+                "overrun_pct": overrun_pct,
+            })
+        # Subtarefa ativa sem nenhum apontamento (falta de transparencia)
+        elif cat == "indeterminate" and spent == 0 and orig > 0:
+            overdue.append({
+                "key":        st["key"],
+                "summary":    f.get("summary", "")[:60],
+                "status":     f["status"]["name"],
+                "original_h": orig,
+                "spent_h":    0,
+                "overrun_pct": None,
+                "aviso":      "sem apontamento",
+            })
+
+    return {
+        "total_subtasks":    len(subtasks),
+        "original_estimate_h": round(total_orig, 1),
+        "time_spent_h":      round(total_spent, 1),
+        "remaining_h":       round(total_rem, 1),
+        "overdue_subtasks":  overdue,
+    }
+
+
 def get_sprint_stories_detail(board_id: int, sprint_id: int = None,
                                status_filter: str = None):
     """Retorna historias do sprint com time-in-status e risco de atraso.
@@ -398,20 +457,45 @@ def get_sprint_stories_detail(board_id: int, sprint_id: int = None,
         status   = f["status"]["name"]
 
         time_data = get_issue_time_in_status(s["key"])
-        risk      = calculate_delay_risk(time_data)
+
+        # Substituir estimativas da historia pelo agregado das subtarefas,
+        # pois o time aponta horas nas subtarefas — nao na historia pai.
+        sub_agg = _get_subtask_aggregate(s["key"])
+        if sub_agg["total_subtasks"] > 0:
+            time_data["original_estimate_hours"] = sub_agg["original_estimate_h"]
+            time_data["time_spent_hours"]         = sub_agg["time_spent_h"]
+            time_data["remaining_hours"]           = sub_agg["remaining_h"]
+
+        risk = calculate_delay_risk(time_data)
+
+        # Se ha subtarefas com tempo excedido, o risco minimo e MEDIO
+        if sub_agg["overdue_subtasks"] and risk["nivel"] in ("N/A", "SEM_ESTIMATIVA", "BAIXO"):
+            risk = {
+                "nivel": "MEDIO",
+                "fatores": [f"subtarefa {st['key']} com tempo excedido ou sem apontamento"
+                            for st in sub_agg["overdue_subtasks"]],
+            }
+
+        # Label amigavel para Em Testes
+        status_label = "Em Testes (dev concluido)" if status.lower() == "em testes" else status
 
         results.append({
-            "key": s["key"],
-            "summary": f.get("summary", "")[:80],
-            "status": status,
-            "assignee": assignee,
-            "original_estimate_h": time_data["original_estimate_hours"],
-            "spent_h": time_data["time_spent_hours"],
-            "remaining_h": time_data["remaining_hours"],
-            "days_in_status": time_data["time_in_current_status_days"],
-            "risk": risk["nivel"],
-            "risk_detail": risk.get("fatores", []),
-            "status_history": time_data["status_history"],
+            "key":              s["key"],
+            "summary":          f.get("summary", "")[:80],
+            "status":           status_label,
+            "assignee":         assignee,
+            "days_in_status":   time_data["time_in_current_status_days"],
+            "subtasks_total":   sub_agg["total_subtasks"],
+            "original_estimate_h": sub_agg["original_estimate_h"] if sub_agg["total_subtasks"] > 0
+                                   else time_data["original_estimate_hours"],
+            "spent_h":          sub_agg["time_spent_h"] if sub_agg["total_subtasks"] > 0
+                                else time_data["time_spent_hours"],
+            "remaining_h":      sub_agg["remaining_h"] if sub_agg["total_subtasks"] > 0
+                                else time_data["remaining_hours"],
+            "risk":             risk["nivel"],
+            "risk_detail":      risk.get("fatores", []),
+            "subtasks_overdue": sub_agg["overdue_subtasks"],
+            "status_history":   time_data["status_history"],
         })
 
     return sorted(results, key=lambda x: (
