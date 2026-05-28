@@ -1,17 +1,27 @@
 """
-Jira Analytics — modulo de analise de sprints, responsaveis, epicos e consultas livres.
-Reutiliza autenticacao e chamadas da jira-epic-automator via JIRA_EMAIL + JIRA_API_TOKEN.
+Jira Analytics — sprints, responsaveis, epicos e consultas livres.
+Reutiliza JIRA_EMAIL + JIRA_API_TOKEN da jira-epic-automator.
 """
 import os
 import sys
 import requests
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from collections import defaultdict
+from statistics import mean, stdev
 
-JIRA_BASE = "https://qx3prod.atlassian.net/rest/api/3"
+JIRA_BASE  = "https://qx3prod.atlassian.net/rest/api/3"
 JIRA_AGILE = "https://qx3prod.atlassian.net/rest/agile/1.0"
-PROJECTS = ["TPROJ", "TNP", "TLIGHTDIST", "TLIGHTCOM", "THP", "TTRD", "TSRV", "PROJTHUN", "SUP", "TVAR"]
+PROJECTS   = ["TPROJ", "TNP", "TLIGHTDIST", "TLIGHTCOM", "THP",
+              "TTRD", "TSRV", "PROJTHUN", "SUP", "TVAR"]
 
+# Status que indicam trabalho ativo (para calcular risco de atraso)
+IN_PROGRESS_STATUSES = {"em andamento", "in progress", "doing", "em desenvolvimento",
+                        "em analise", "em análise", "development", "em testes", "in review"}
+
+
+# ---------------------------------------------------------------------------
+# Helpers de API
+# ---------------------------------------------------------------------------
 
 def _auth():
     email = os.environ.get("JIRA_EMAIL")
@@ -30,18 +40,19 @@ def _get(path, params=None, base=JIRA_BASE):
 
 def _post(path, body, base=JIRA_BASE):
     r = requests.post(f"{base}{path}", auth=_auth(),
-                      headers={"Accept": "application/json", "Content-Type": "application/json"},
+                      headers={"Accept": "application/json",
+                               "Content-Type": "application/json"},
                       json=body)
     r.raise_for_status()
     return r.json() if r.content else {}
 
 
 def _search(jql, fields, max_results=500):
-    results = []
-    next_token = None
+    results, next_token = [], None
     fields_list = fields if isinstance(fields, list) else fields.split(",")
     while True:
-        payload = {"jql": jql, "fields": fields_list, "maxResults": min(100, max_results)}
+        payload = {"jql": jql, "fields": fields_list,
+                   "maxResults": min(100, max_results)}
         if next_token:
             payload["nextPageToken"] = next_token
         data = _post("/search/jql", payload)
@@ -53,133 +64,528 @@ def _search(jql, fields, max_results=500):
     return results
 
 
+def _parse_dt(s):
+    """Converte string ISO do Jira para datetime UTC-aware."""
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _hours(seconds):
+    return round(seconds / 3600, 1) if seconds else 0
+
+
+def _pts(val):
+    """Extrai story points independente do tipo retornado."""
+    if val is None:
+        return 0
+    if isinstance(val, (int, float)):
+        return float(val)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Time in status + risco de atraso
+# ---------------------------------------------------------------------------
+
+def get_issue_time_in_status(issue_key: str) -> dict:
+    """Retorna quanto tempo cada issue passou em cada status (via changelog).
+
+    Retorna dict com:
+      current_status, time_in_current_status_hours, time_in_current_status_days,
+      status_history: [{status, start, end, hours}],
+      original_estimate_hours, time_spent_hours, remaining_hours
+    """
+    data = _get(f"/issue/{issue_key}",
+                params={"expand": "changelog",
+                        "fields": "status,timeoriginalestimate,timespent,"
+                                  "timeestimate,summary,assignee,issuetype"})
+    f = data["fields"]
+    current_status = f["status"]["name"]
+    now = datetime.now(timezone.utc)
+
+    # Reconstruir linha do tempo de status a partir do changelog
+    histories = sorted(data["changelog"]["histories"],
+                       key=lambda h: h["created"])
+
+    # Encontrar a data de criacao como ponto inicial
+    created_str = data.get("fields", {}).get("created") or histories[0]["created"] if histories else None
+    # Se nao tiver created no fields, busca separado
+    if not created_str:
+        d2 = _get(f"/issue/{issue_key}", params={"fields": "created"})
+        created_str = d2["fields"].get("created")
+
+    # Montar lista de transicoes de status
+    transitions = []
+    for hist in histories:
+        for item in hist["items"]:
+            if item["field"] == "status":
+                transitions.append({
+                    "to": item["toString"],
+                    "at": _parse_dt(hist["created"]),
+                })
+
+    # Calcular tempo por status
+    status_history = []
+    initial_status = "To Do"
+    if transitions:
+        # Antes da primeira transicao o issue estava no status inicial
+        start = _parse_dt(created_str) if created_str else transitions[0]["at"]
+        prev_status = initial_status
+        for tr in transitions:
+            end = tr["at"]
+            if start and end and end > start:
+                hours = (end - start).total_seconds() / 3600
+                status_history.append({
+                    "status": prev_status,
+                    "start": start.isoformat()[:16],
+                    "end": end.isoformat()[:16],
+                    "hours": round(hours, 1),
+                    "days": round(hours / 8, 1),  # dias uteis aproximados
+                })
+            prev_status = tr["to"]
+            start = tr["at"]
+        # Status atual (em aberto)
+        if start:
+            hours = (now - start).total_seconds() / 3600
+            status_history.append({
+                "status": prev_status,
+                "start": start.isoformat()[:16],
+                "end": None,
+                "hours": round(hours, 1),
+                "days": round(hours / 8, 1),
+            })
+    else:
+        # Sem historico de transicoes — esta no status original desde a criacao
+        start = _parse_dt(created_str) if created_str else now
+        hours = (now - start).total_seconds() / 3600
+        status_history.append({
+            "status": current_status,
+            "start": start.isoformat()[:16],
+            "end": None,
+            "hours": round(hours, 1),
+            "days": round(hours / 8, 1),
+        })
+
+    current_entry = next((s for s in reversed(status_history)
+                          if s["status"] == current_status and s["end"] is None), None)
+    time_in_current = current_entry["hours"] if current_entry else 0
+
+    orig_estimate_h = _hours(f.get("timeoriginalestimate") or 0)
+    time_spent_h    = _hours(f.get("timespent") or 0)
+    remaining_h     = _hours(f.get("timeestimate") or 0)
+
+    return {
+        "key": issue_key,
+        "summary": f.get("summary", ""),
+        "assignee": (f.get("assignee") or {}).get("displayName", "—"),
+        "current_status": current_status,
+        "time_in_current_status_hours": round(time_in_current, 1),
+        "time_in_current_status_days": round(time_in_current / 8, 1),
+        "original_estimate_hours": orig_estimate_h,
+        "time_spent_hours": time_spent_h,
+        "remaining_hours": remaining_h,
+        "status_history": status_history,
+    }
+
+
+def calculate_delay_risk(time_data: dict) -> dict:
+    """Calcula score de risco de atraso com base em tempo, estimativas e status.
+
+    Niveis: BAIXO, MEDIO, ALTO, CRITICO, SEM_ESTIMATIVA.
+    """
+    status_norm = time_data["current_status"].lower()
+    is_active = any(s in status_norm for s in IN_PROGRESS_STATUSES)
+
+    if not is_active:
+        return {"nivel": "N/A", "motivo": "Issue nao esta em status ativo"}
+
+    orig  = time_data["original_estimate_hours"]
+    spent = time_data["time_spent_hours"]
+    rem   = time_data["remaining_hours"]
+    days_in_status = time_data["time_in_current_status_days"]
+
+    fatores = []
+
+    if orig == 0:
+        # Sem estimativa — risco por falta de transparencia
+        if days_in_status >= 3:
+            return {
+                "nivel": "ALTO",
+                "motivo": f"Sem estimativa original e {days_in_status:.1f} dias no status atual",
+                "fatores": ["sem_estimativa", "tempo_sem_atualizacao"],
+            }
+        return {
+            "nivel": "SEM_ESTIMATIVA",
+            "motivo": "Estimativa original nao definida — impossivel prever atraso",
+            "fatores": ["sem_estimativa"],
+        }
+
+    projected = spent + rem if rem > 0 else spent
+    overrun_ratio = projected / orig if orig > 0 else 0
+
+    # Fator 1: ja ultrapassou a estimativa
+    if spent > orig:
+        pct = round((spent / orig - 1) * 100)
+        fatores.append(f"ja {pct}% acima da estimativa ({spent}h gasto vs {orig}h estimado)")
+
+    # Fator 2: projecao de estouro
+    elif overrun_ratio > 1:
+        pct = round((overrun_ratio - 1) * 100)
+        fatores.append(f"projecao {pct}% acima ({spent}h gasto + {rem}h restante vs {orig}h estimado)")
+
+    # Fator 3: tempo no status atual vs estimativa total
+    if orig > 0 and days_in_status > (orig / 8) * 0.8:
+        fatores.append(f"{days_in_status:.1f} dias no status atual (estimativa total: {orig/8:.1f} dias)")
+
+    # Fator 4: sem log de tempo (sem_transparencia)
+    if orig > 0 and spent == 0 and days_in_status >= 1:
+        fatores.append("nenhum tempo registrado — sem transparencia de progresso")
+
+    # Classificar nivel
+    if spent > orig * 1.5 or overrun_ratio > 1.5:
+        nivel = "CRITICO"
+    elif spent > orig or overrun_ratio > 1.2:
+        nivel = "ALTO"
+    elif overrun_ratio > 1.0 or (spent == 0 and days_in_status >= 2):
+        nivel = "MEDIO"
+    else:
+        nivel = "BAIXO"
+
+    return {
+        "nivel": nivel,
+        "overrun_ratio": round(overrun_ratio, 2),
+        "original_estimate_h": orig,
+        "spent_h": spent,
+        "remaining_h": rem,
+        "days_in_current_status": days_in_status,
+        "fatores": fatores if fatores else ["dentro do prazo estimado"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Modulo 1: Sprints
 # ---------------------------------------------------------------------------
 
 def list_boards(project_key=None):
-    """Lista todos os boards acessiveis, opcionalmente filtrando por projeto."""
-    params = {"maxResults": 50}
-    if project_key:
-        params["projectKeyOrId"] = project_key
-    data = _get("/board", params=params, base=JIRA_AGILE)
-    return data.get("values", [])
+    """Lista todos os boards acessiveis (com paginacao completa)."""
+    all_boards, start = [], 0
+    while True:
+        params = {"maxResults": 50, "startAt": start}
+        if project_key:
+            params["projectKeyOrId"] = project_key
+        data = _get("/board", params=params, base=JIRA_AGILE)
+        values = data.get("values", [])
+        all_boards.extend(values)
+        if data.get("isLast", True) or not values:
+            break
+        start += len(values)
+    return all_boards
+
+
+def _get_active_sprint(board_id: int):
+    """Retorna o sprint ativo de um board. Sempre prioriza o ativo."""
+    sprints = _get(f"/board/{board_id}/sprint",
+                   params={"state": "active"}, base=JIRA_AGILE)
+    values = sprints.get("values", [])
+    if values:
+        return values[0]
+    # Fallback: ultimo fechado
+    closed = _get(f"/board/{board_id}/sprint",
+                  params={"state": "closed", "maxResults": 10}, base=JIRA_AGILE)
+    closed_vals = sorted(closed.get("values", []),
+                         key=lambda s: s.get("endDate", ""), reverse=True)
+    return closed_vals[0] if closed_vals else None
+
+
+def _get_sprint_stories(board_id: int, sprint_id: int):
+    """Retorna apenas historias (sem subtarefas) de um sprint."""
+    issues = _get(
+        f"/board/{board_id}/sprint/{sprint_id}/issue",
+        params={"maxResults": 500,
+                "fields": "summary,status,assignee,issuetype,priority,"
+                          "timeoriginalestimate,timespent,timeestimate,"
+                          "customfield_10016"},
+        base=JIRA_AGILE
+    ).get("issues", [])
+
+    # Filtrar subtarefas
+    return [i for i in issues if not i["fields"]["issuetype"].get("subtask", False)]
 
 
 def get_sprint_report(board_id: int, sprint_id: int = None):
-    """Retorna metricas de um sprint especifico ou do sprint ativo de um board.
+    """Metricas do sprint ativo (ou especifico se sprint_id informado).
 
-    Metricas: total de historias, concluidas, em andamento, nao iniciadas,
-    taxa de conclusao, story points (se preenchidos), lista de nao concluidas.
+    Inclui apenas historias — subtarefas sao excluidas.
     """
-    if sprint_id:
-        sprint = _get(f"/sprint/{sprint_id}", base=JIRA_AGILE)
-    else:
-        sprints = _get(f"/board/{board_id}/sprint",
-                       params={"state": "active"}, base=JIRA_AGILE)
-        values = sprints.get("values", [])
-        if not values:
-            sprints = _get(f"/board/{board_id}/sprint",
-                           params={"state": "closed"}, base=JIRA_AGILE)
-            values = sorted(sprints.get("values", []),
-                            key=lambda s: s.get("endDate", ""), reverse=True)
-        if not values:
-            return {"erro": f"Nenhum sprint encontrado no board {board_id}"}
-        sprint = values[0]
+    sprint = (_get(f"/sprint/{sprint_id}", base=JIRA_AGILE)
+              if sprint_id else _get_active_sprint(board_id))
+    if not sprint:
+        return {"erro": f"Nenhum sprint encontrado no board {board_id}"}
 
-    sprint_id = sprint["id"]
-    sprint_name = sprint.get("name", f"Sprint {sprint_id}")
-    sprint_state = sprint.get("state", "")
+    sprint_id  = sprint["id"]
     start = sprint.get("startDate", "")[:10] if sprint.get("startDate") else "—"
-    end = sprint.get("endDate", "")[:10] if sprint.get("endDate") else "—"
+    end   = sprint.get("endDate", "")[:10]   if sprint.get("endDate") else "—"
 
-    issues = _get(f"/board/{board_id}/sprint/{sprint_id}/issue",
-                  params={"maxResults": 500,
-                          "fields": "summary,status,assignee,story_points,customfield_10016,resolutiondate"},
-                  base=JIRA_AGILE).get("issues", [])
+    stories = _get_sprint_stories(board_id, sprint_id)
 
     done, in_progress, todo, no_assignee = [], [], [], []
-    total_points, done_points = 0, 0
+    total_pts = done_pts = 0
 
-    for issue in issues:
-        f = issue["fields"]
-        cat = f.get("status", {}).get("statusCategory", {}).get("key", "")
-        points = f.get("customfield_10016") or 0
-        total_points += points
-        assignee = (f.get("assignee") or {}).get("displayName", "Sem responsavel")
-        if assignee == "Sem responsavel":
-            no_assignee.append(issue["key"])
-
+    for s in stories:
+        f   = s["fields"]
+        cat = f["status"]["statusCategory"]["key"]
+        pts = _pts(f.get("customfield_10016"))
+        total_pts += pts
+        assignee = (f.get("assignee") or {}).get("displayName", "")
+        if not assignee:
+            no_assignee.append(s["key"])
         if cat == "done":
-            done.append(issue["key"])
-            done_points += points
+            done.append(s["key"]); done_pts += pts
         elif cat == "indeterminate":
-            in_progress.append(issue["key"])
+            in_progress.append(s["key"])
         else:
-            todo.append(issue["key"])
+            todo.append(s["key"])
 
-    total = len(issues)
-    taxa = round(len(done) / total * 100, 1) if total else 0
+    total = len(stories)
+    taxa  = round(len(done) / total * 100, 1) if total else 0
 
     return {
-        "sprint": sprint_name,
-        "estado": sprint_state,
+        "sprint": sprint.get("name"),
+        "estado": sprint.get("state"),
         "periodo": f"{start} a {end}",
         "total_historias": total,
         "concluidas": len(done),
         "em_andamento": len(in_progress),
         "nao_iniciadas": len(todo),
         "taxa_conclusao": f"{taxa}%",
-        "story_points_total": total_points,
-        "story_points_concluidos": done_points,
+        "story_points_total": total_pts,
+        "story_points_concluidos": done_pts,
         "sem_responsavel": no_assignee,
         "nao_concluidas": in_progress + todo,
+        "keys_em_andamento": in_progress,
+        "keys_nao_iniciadas": todo,
     }
 
 
+def get_sprint_stories_detail(board_id: int, sprint_id: int = None,
+                               status_filter: str = None):
+    """Retorna historias do sprint com time-in-status e risco de atraso.
+
+    status_filter: 'in_progress', 'todo', 'done' ou None (todas)
+    """
+    sprint = (_get(f"/sprint/{sprint_id}", base=JIRA_AGILE)
+              if sprint_id else _get_active_sprint(board_id))
+    if not sprint:
+        return []
+
+    stories = _get_sprint_stories(board_id, sprint["id"])
+
+    cat_map = {"in_progress": "indeterminate", "done": "done", "todo": "new"}
+    if status_filter and status_filter in cat_map:
+        target_cat = cat_map[status_filter]
+        stories = [s for s in stories
+                   if s["fields"]["status"]["statusCategory"]["key"] == target_cat]
+
+    results = []
+    for s in stories:
+        f        = s["fields"]
+        assignee = (f.get("assignee") or {}).get("displayName", "Sem responsavel")
+        status   = f["status"]["name"]
+
+        time_data = get_issue_time_in_status(s["key"])
+        risk      = calculate_delay_risk(time_data)
+
+        results.append({
+            "key": s["key"],
+            "summary": f.get("summary", "")[:80],
+            "status": status,
+            "assignee": assignee,
+            "original_estimate_h": time_data["original_estimate_hours"],
+            "spent_h": time_data["time_spent_hours"],
+            "remaining_h": time_data["remaining_hours"],
+            "days_in_status": time_data["time_in_current_status_days"],
+            "risk": risk["nivel"],
+            "risk_detail": risk.get("fatores", []),
+            "status_history": time_data["status_history"],
+        })
+
+    return sorted(results, key=lambda x: (
+        ["CRITICO", "ALTO", "MEDIO", "BAIXO", "SEM_ESTIMATIVA", "N/A"].index(
+            x["risk"] if x["risk"] in ["CRITICO", "ALTO", "MEDIO", "BAIXO",
+                                        "SEM_ESTIMATIVA", "N/A"] else "N/A"
+        )
+    ))
+
+
 def get_sprint_velocity(board_id: int, num_sprints: int = 5):
-    """Calcula velocidade media dos ultimos N sprints fechados."""
-    sprints_data = _get(f"/board/{board_id}/sprint",
-                        params={"state": "closed", "maxResults": num_sprints},
-                        base=JIRA_AGILE)
-    sprints = sorted(sprints_data.get("values", []),
+    """Velocidade dos ultimos N sprints fechados (historias e story points)."""
+    data = _get(f"/board/{board_id}/sprint",
+                params={"state": "closed", "maxResults": num_sprints * 2},
+                base=JIRA_AGILE)
+    sprints = sorted(data.get("values", []),
                      key=lambda s: s.get("endDate", ""), reverse=True)[:num_sprints]
 
     velocities = []
     for sprint in sprints:
-        issues = _get(f"/board/{board_id}/sprint/{sprint['id']}/issue",
-                      params={"maxResults": 500,
-                              "fields": "status,customfield_10016"},
-                      base=JIRA_AGILE).get("issues", [])
-        pts = sum(
-            (i["fields"].get("customfield_10016") or 0)
-            for i in issues
-            if i["fields"].get("status", {}).get("statusCategory", {}).get("key") == "done"
-        )
+        stories = _get_sprint_stories(board_id, sprint["id"])
+        done_stories = [s for s in stories
+                        if s["fields"]["status"]["statusCategory"]["key"] == "done"]
+        pts = sum(_pts(s["fields"].get("customfield_10016")) for s in done_stories)
         velocities.append({
             "sprint": sprint.get("name"),
-            "points_concluidos": pts,
+            "periodo": sprint.get("endDate", "")[:10],
+            "historias_concluidas": len(done_stories),
+            "total_historias": len(stories),
+            "taxa_conclusao": f"{round(len(done_stories)/len(stories)*100,1)}%" if stories else "0%",
+            "story_points": pts,
         })
 
-    avg = round(sum(v["points_concluidos"] for v in velocities) / len(velocities), 1) if velocities else 0
+    avg_stories = round(mean(v["historias_concluidas"] for v in velocities), 1) if velocities else 0
+    avg_pts     = round(mean(v["story_points"] for v in velocities), 1) if velocities else 0
+
     return {
         "board_id": board_id,
         "sprints_analisados": len(velocities),
-        "velocidade_media": avg,
+        "media_historias_por_sprint": avg_stories,
+        "media_story_points": avg_pts,
         "historico": velocities,
     }
 
 
 # ---------------------------------------------------------------------------
-# Modulo 2: Responsaveis
+# Modulo 2: Responsaveis — metricas por desenvolvedor
 # ---------------------------------------------------------------------------
 
-def get_assignee_workload(project_keys=None, sprint_state="active"):
-    """Analisa carga de trabalho por responsavel nos projetos monitorados."""
+def _get_developer_sprint_data(board_id: int, sprint) -> dict:
+    """Extrai dados de um sprint por desenvolvedor (historias, conclusao, estimativas)."""
+    stories   = _get_sprint_stories(board_id, sprint["id"])
+    by_dev    = defaultdict(lambda: {
+        "committed": 0, "done": 0,
+        "estimated_h": 0, "spent_h": 0,
+        "cycle_times_h": [],
+    })
+
+    for s in stories:
+        f        = s["fields"]
+        assignee = (f.get("assignee") or {}).get("displayName")
+        if not assignee:
+            continue
+        cat = f["status"]["statusCategory"]["key"]
+        by_dev[assignee]["committed"] += 1
+        by_dev[assignee]["estimated_h"] += _hours(f.get("timeoriginalestimate") or 0)
+        by_dev[assignee]["spent_h"]     += _hours(f.get("timespent") or 0)
+
+        if cat == "done":
+            by_dev[assignee]["done"] += 1
+
+    return dict(by_dev)
+
+
+def get_developer_metrics(board_id: int, num_sprints: int = 5):
+    """Metricas ageis por desenvolvedor com base nos ultimos N sprints fechados.
+
+    Metricas calculadas:
+    - Taxa de entrega (delivery rate): % historias concluidas vs comprometidas
+    - Confianca media: estabilidade da taxa de entrega ao longo dos sprints
+    - Erro de estimativa (MAPE): desvio medio entre estimativa e tempo real
+    - Throughput medio: historias entregues por sprint
+    - Ciclo medio: sera calculado se solicitado com detalhamento por issue
+    """
+    data = _get(f"/board/{board_id}/sprint",
+                params={"state": "closed", "maxResults": num_sprints * 2},
+                base=JIRA_AGILE)
+    sprints = sorted(data.get("values", []),
+                     key=lambda s: s.get("endDate", ""), reverse=True)[:num_sprints]
+
+    # Acumular dados por desenvolvedor por sprint
+    dev_sprints = defaultdict(list)
+    for sprint in sprints:
+        sprint_data = _get_developer_sprint_data(board_id, sprint)
+        for dev, metrics in sprint_data.items():
+            dev_sprints[dev].append({
+                "sprint": sprint.get("name"),
+                **metrics,
+            })
+
+    results = {}
+    for dev, sprint_list in dev_sprints.items():
+        delivery_rates = []
+        estimation_errors = []
+        throughputs = []
+
+        for sp in sprint_list:
+            # Taxa de entrega
+            if sp["committed"] > 0:
+                rate = sp["done"] / sp["committed"] * 100
+                delivery_rates.append(rate)
+                throughputs.append(sp["done"])
+
+            # Erro de estimativa (MAPE) — so quando ha estimativa E tempo registrado
+            if sp["estimated_h"] > 0 and sp["spent_h"] > 0:
+                mape = abs(sp["spent_h"] - sp["estimated_h"]) / sp["estimated_h"] * 100
+                estimation_errors.append(mape)
+
+        avg_delivery   = round(mean(delivery_rates), 1)    if delivery_rates   else None
+        std_delivery   = round(stdev(delivery_rates), 1)   if len(delivery_rates) > 1 else 0
+        avg_mape       = round(mean(estimation_errors), 1) if estimation_errors else None
+        avg_throughput = round(mean(throughputs), 1)       if throughputs       else 0
+
+        # Nivel de confianca baseado na taxa media e consistencia
+        if avg_delivery is None:
+            confianca = "SEM_DADOS"
+        elif avg_delivery >= 85 and std_delivery <= 10:
+            confianca = "ALTA"
+        elif avg_delivery >= 70 and std_delivery <= 20:
+            confianca = "MEDIA"
+        elif avg_delivery >= 50:
+            confianca = "BAIXA"
+        else:
+            confianca = "CRITICA"
+
+        # Classificacao do erro de estimativa
+        if avg_mape is None:
+            estimativa_label = "SEM_DADOS"
+        elif avg_mape <= 20:
+            estimativa_label = "PRECISO"
+        elif avg_mape <= 40:
+            estimativa_label = "ACEITAVEL"
+        elif avg_mape <= 70:
+            estimativa_label = "IMPRECISO"
+        else:
+            estimativa_label = "MUITO_IMPRECISO"
+
+        results[dev] = {
+            "sprints_analisados": len(sprint_list),
+            "taxa_entrega_media": f"{avg_delivery}%" if avg_delivery is not None else "—",
+            "variacao_entrega": f"±{std_delivery}%" if std_delivery else "—",
+            "confianca_entrega": confianca,
+            "throughput_medio": avg_throughput,
+            "erro_estimativa_mape": f"{avg_mape}%" if avg_mape is not None else "—",
+            "precisao_estimativa": estimativa_label,
+            "historico_sprints": sprint_list,
+        }
+
+    # Ordenar por taxa de entrega (melhor primeiro)
+    return dict(sorted(
+        results.items(),
+        key=lambda x: float(x[1]["taxa_entrega_media"].replace("%","") or 0)
+                      if x[1]["taxa_entrega_media"] != "—" else -1,
+        reverse=True
+    ))
+
+
+def get_assignee_workload(project_keys=None):
+    """Carga atual de todos os responsaveis nos sprints abertos."""
     projects = project_keys or PROJECTS
     jql = (
         f'project in ({",".join(projects)}) '
-        f'AND issuetype in (Story, Task, Bug) '
+        f'AND issuetype in standardIssueTypes() '
+        f'AND issuetype not in subTaskIssueTypes() '
         f'AND sprint in openSprints() '
         f'AND assignee is not EMPTY'
     )
@@ -188,12 +594,11 @@ def get_assignee_workload(project_keys=None, sprint_state="active"):
     workload = defaultdict(lambda: {"total": 0, "done": 0, "in_progress": 0,
                                     "todo": 0, "points": 0, "issues": []})
     for issue in issues:
-        f = issue["fields"]
+        f        = issue["fields"]
         assignee = (f.get("assignee") or {}).get("displayName", "Desconhecido")
-        cat = f.get("status", {}).get("statusCategory", {}).get("key", "")
-        pts = f.get("customfield_10016") or 0
-
-        workload[assignee]["total"] += 1
+        cat      = f["status"]["statusCategory"]["key"]
+        pts      = _pts(f.get("customfield_10016"))
+        workload[assignee]["total"]  += 1
         workload[assignee]["points"] += pts
         workload[assignee]["issues"].append(issue["key"])
         if cat == "done":
@@ -203,42 +608,39 @@ def get_assignee_workload(project_keys=None, sprint_state="active"):
         else:
             workload[assignee]["todo"] += 1
 
-    return dict(sorted(workload.items(), key=lambda x: x[1]["total"], reverse=True))
+    return dict(sorted(workload.items(),
+                       key=lambda x: x[1]["total"], reverse=True))
 
 
 def get_assignee_productivity(assignee_query: str, days: int = 30):
-    """Analisa produtividade de um responsavel nos ultimos N dias."""
+    """Produtividade individual nos ultimos N dias."""
     since = (date.today() - timedelta(days=days)).isoformat()
     users = requests.get(
-        f"{JIRA_BASE}/user/search",
-        auth=_auth(),
+        f"{JIRA_BASE}/user/search", auth=_auth(),
         headers={"Accept": "application/json"},
         params={"query": assignee_query, "maxResults": 5}
     ).json()
-
     if not users:
         return {"erro": f"Nenhum usuario encontrado para '{assignee_query}'"}
     user = users[0]
-    account_id = user["accountId"]
+    account_id   = user["accountId"]
     display_name = user["displayName"]
 
-    jql = (
-        f'assignee = "{account_id}" '
-        f'AND resolutiondate >= "{since}" '
+    done_issues = _search(
+        f'assignee = "{account_id}" AND resolutiondate >= "{since}" '
         f'AND statusCategory = Done '
-        f'AND issuetype in (Story, Task, Bug)'
+        f'AND issuetype in standardIssueTypes() '
+        f'AND issuetype not in subTaskIssueTypes()',
+        "summary,resolutiondate,customfield_10016,priority,issuetype"
     )
-    done_issues = _search(jql, "summary,resolutiondate,customfield_10016,priority,issuetype")
-
-    jql_open = (
-        f'assignee = "{account_id}" '
-        f'AND statusCategory != Done '
-        f'AND issuetype in (Story, Task, Bug)'
+    open_issues = _search(
+        f'assignee = "{account_id}" AND statusCategory != Done '
+        f'AND issuetype in standardIssueTypes() '
+        f'AND issuetype not in subTaskIssueTypes()',
+        "summary,status,customfield_10016,priority,issuetype"
     )
-    open_issues = _search(jql_open, "summary,status,customfield_10016,priority,issuetype")
-
-    done_pts = sum(i["fields"].get("customfield_10016") or 0 for i in done_issues)
-    open_pts = sum(i["fields"].get("customfield_10016") or 0 for i in open_issues)
+    done_pts = sum(_pts(i["fields"].get("customfield_10016")) for i in done_issues)
+    open_pts = sum(_pts(i["fields"].get("customfield_10016")) for i in open_issues)
 
     return {
         "responsavel": display_name,
@@ -257,71 +659,59 @@ def get_assignee_productivity(assignee_query: str, days: int = 30):
 # ---------------------------------------------------------------------------
 
 def get_epics_health(project_keys=None):
-    """Analisa saude dos epicos: progresso, campos faltando, riscos e SLA de garantia."""
+    """Diagnostico de epicos ativos: campos faltando, garantia vencida, riscos."""
     from pathlib import Path
     import json
 
-    projects = project_keys or PROJECTS
+    projects     = project_keys or PROJECTS
     fields_cache = Path.home() / ".claude" / "jira-epic-automator-fields.json"
-    custom = {}
+    custom       = {}
     if fields_cache.exists():
         with open(fields_cache) as fp:
             custom = json.load(fp)
 
-    pub_fid = custom.get("field_publication_date", "customfield_11336")
+    pub_fid     = custom.get("field_publication_date", "customfield_11336")
     warranty_fid = custom.get("field_warranty_date", "customfield_12167")
     quarter_fid = custom.get("field_quarter", "customfield_11450")
-    start_fid = custom.get("field_start_date", "customfield_11201")
-    due_fid = custom.get("field_due_date", "duedate")
+    start_fid   = custom.get("field_start_date", "customfield_11201")
 
     excluded = '"Em Producao", "Em Produção", "Concluido", "Concluído", "Done", "Fechado", "Closed"'
-    jql = (
-        f'issuetype = Epic AND project in ({",".join(projects)}) '
-        f'AND status not in ({excluded})'
-    )
-    fields = f"summary,status,assignee,{pub_fid},{warranty_fid},{quarter_fid},{start_fid},{due_fid},fixVersions"
-    epics = _search(jql, fields, max_results=300)
+    jql      = (f'issuetype = Epic AND project in ({",".join(projects)}) '
+                f'AND status not in ({excluded})')
+    fields   = f"summary,status,assignee,{pub_fid},{warranty_fid},{quarter_fid},{start_fid},fixVersions"
+    epics    = _search(jql, fields, max_results=300)
 
-    today = date.today()
+    today  = date.today()
     report = {
         "total": len(epics),
-        "sem_responsavel": [],
-        "sem_quarter": [],
-        "sem_start_date": [],
-        "sem_data_publicacao": [],
-        "garantia_vencida": [],
-        "em_risco": [],
-        "saudaveis": [],
+        "sem_responsavel": [], "sem_quarter": [],
+        "sem_start_date": [], "sem_data_publicacao": [],
+        "garantia_vencida": [], "em_risco": [], "saudaveis": [],
     }
 
     for epic in epics:
-        f = epic["fields"]
-        key = epic["key"]
-        summary = f.get("summary", "")
+        f      = epic["fields"]
+        key    = epic["key"]
         issues = []
-
         if not f.get("assignee"):
-            issues.append("sem responsavel")
-            report["sem_responsavel"].append(key)
+            issues.append("sem responsavel"); report["sem_responsavel"].append(key)
         if not f.get(quarter_fid):
-            issues.append("sem quarter")
-            report["sem_quarter"].append(key)
+            issues.append("sem quarter");     report["sem_quarter"].append(key)
         if not f.get(start_fid):
-            issues.append("sem start date")
-            report["sem_start_date"].append(key)
+            issues.append("sem start date");  report["sem_start_date"].append(key)
         if not f.get(pub_fid):
-            issues.append("sem data de publicacao")
-            report["sem_data_publicacao"].append(key)
-
+            issues.append("sem data de publicacao"); report["sem_data_publicacao"].append(key)
         warranty_str = f.get(warranty_fid)
         if warranty_str:
-            warranty_date = date.fromisoformat(warranty_str[:10])
-            if today > warranty_date:
+            if today > date.fromisoformat(warranty_str[:10]):
                 issues.append(f"garantia vencida em {warranty_str[:10]}")
                 report["garantia_vencida"].append(key)
-
         if issues:
-            report["em_risco"].append({"key": key, "summary": summary, "issues": issues})
+            report["em_risco"].append({
+                "key": key,
+                "summary": f.get("summary", ""),
+                "issues": issues
+            })
         else:
             report["saudaveis"].append(key)
 
@@ -329,40 +719,41 @@ def get_epics_health(project_keys=None):
 
 
 def get_epic_progress(epic_key: str):
-    """Retorna progresso detalhado de um epico: historias por status, % conclusao."""
-    issues = _search(
+    """Progresso detalhado de um epico: historias por status e % conclusao."""
+    stories = _search(
         f'"Epic Link" = {epic_key} OR parent = {epic_key}',
         "summary,status,assignee,customfield_10016,issuetype",
         max_results=200
     )
+    # Separar historias de subtarefas
+    stories_only   = [s for s in stories if not s["fields"]["issuetype"].get("subtask", False)]
+    subtasks_only  = [s for s in stories if s["fields"]["issuetype"].get("subtask", False)]
 
-    if not issues:
-        return {"epic": epic_key, "erro": "Nenhuma historia encontrada"}
+    if not stories_only:
+        return {"epic": epic_key, "historias": 0, "subtarefas": len(subtasks_only),
+                "aviso": "Nenhuma historia encontrada"}
 
-    by_status = defaultdict(list)
-    total_pts, done_pts = 0, 0
-    for issue in issues:
-        f = issue["fields"]
-        status = f.get("status", {}).get("name", "Desconhecido")
-        cat = f.get("status", {}).get("statusCategory", {}).get("key", "")
-        pts = f.get("customfield_10016") or 0
+    by_status     = defaultdict(list)
+    done_issues   = []
+    total_pts = done_pts = 0
+
+    for s in stories_only:
+        f      = s["fields"]
+        status = f["status"]["name"]
+        cat    = f["status"]["statusCategory"]["key"]
+        pts    = _pts(f.get("customfield_10016"))
         total_pts += pts
+        by_status[status].append(s["key"])
         if cat == "done":
-            done_pts += pts
-        by_status[status].append(issue["key"])
+            done_issues.append(s["key"]); done_pts += pts
 
-    total = len(issues)
-    done_count = sum(len(v) for k, v in by_status.items()
-                     if _search(f'issue = {v[0]}', "status")[0]["fields"]
-                     ["status"]["statusCategory"]["key"] == "done") if issues else 0
-
-    done_issues = [i for i in issues
-                   if i["fields"]["status"]["statusCategory"]["key"] == "done"]
-    pct = round(len(done_issues) / total * 100, 1) if total else 0
+    total = len(stories_only)
+    pct   = round(len(done_issues) / total * 100, 1) if total else 0
 
     return {
         "epic": epic_key,
         "total_historias": total,
+        "total_subtarefas": len(subtasks_only),
         "concluidas": len(done_issues),
         "percentual_conclusao": f"{pct}%",
         "story_points_total": total_pts,
@@ -372,23 +763,23 @@ def get_epic_progress(epic_key: str):
 
 
 # ---------------------------------------------------------------------------
-# Modulo 4: Consulta Livre (JQL + resumo)
+# Modulo 4: Consulta Livre
 # ---------------------------------------------------------------------------
 
-def free_query(jql: str, fields: str = "summary,status,assignee,priority,issuetype",
+def free_query(jql: str,
+               fields: str = "summary,status,assignee,priority,issuetype",
                max_results: int = 50):
-    """Executa JQL livre e retorna lista estruturada de issues."""
+    """Executa qualquer JQL e retorna resultado estruturado."""
     issues = _search(jql, fields, max_results=max_results)
-
-    rows = []
+    rows   = []
     for issue in issues:
         f = issue["fields"]
         rows.append({
-            "key": issue["key"],
-            "resumo": f.get("summary", ""),
-            "status": f.get("status", {}).get("name", ""),
+            "key":        issue["key"],
+            "resumo":     f.get("summary", ""),
+            "status":     f.get("status", {}).get("name", ""),
             "responsavel": (f.get("assignee") or {}).get("displayName", "—"),
             "prioridade": (f.get("priority") or {}).get("name", "—"),
-            "tipo": (f.get("issuetype") or {}).get("name", ""),
+            "tipo":       (f.get("issuetype") or {}).get("name", ""),
         })
     return {"total": len(rows), "issues": rows}
