@@ -573,6 +573,204 @@ def get_sprint_velocity(board_id: int, num_sprints: int = 5):
 # Modulo 2: Responsaveis — metricas por desenvolvedor
 # ---------------------------------------------------------------------------
 
+def _get_sprint_subtask_time(story_keys: list) -> dict:
+    """Agrega tempo de subtarefas para um conjunto de historias em uma unica chamada JQL.
+
+    Retorna {story_key: {original_h, spent_h, remaining_h}}
+    """
+    if not story_keys:
+        return {}
+    keys_str = ",".join(story_keys)
+    subtasks = _search(
+        f"parent in ({keys_str})",
+        "parent,timeoriginalestimate,timespent,timeestimate",
+        max_results=500
+    )
+    by_parent = defaultdict(lambda: {"original_h": 0.0, "spent_h": 0.0, "remaining_h": 0.0})
+    for st in subtasks:
+        f = st["fields"]
+        parent_key = (f.get("parent") or {}).get("key")
+        if parent_key:
+            by_parent[parent_key]["original_h"]  += _hours(f.get("timeoriginalestimate") or 0)
+            by_parent[parent_key]["spent_h"]      += _hours(f.get("timespent") or 0)
+            by_parent[parent_key]["remaining_h"]  += _hours(f.get("timeestimate") or 0)
+    return dict(by_parent)
+
+
+def get_developer_deep_analysis(board_id: int, num_sprints: int = 6):
+    """Analise aprofundada por desenvolvedor: entrega, estimativas, lead time e tendencia.
+
+    Coleta dados individuais por historia (via subtarefas para tempo real).
+    Considera apenas devs presentes em pelo menos 2 sprints (time recorrente).
+
+    Metricas:
+    - Taxa de entrega e variacao (consistencia)
+    - Throughput medio (historias/sprint)
+    - Tamanho medio das historias assumidas (estimativa original)
+    - Lead time medio por historia concluida (horas efetivas gastas)
+    - MAPE: desvio medio entre tempo gasto e estimativa nas historias concluidas
+    - Taxa de overrun: % de historias que excederam a estimativa em >20%
+    - Tendencia: melhora/estabilidade/piora entre primeiros e ultimos sprints
+    - Confianca de entrega e precisao de estimativa classificadas
+    """
+    data = _get(f"/board/{board_id}/sprint",
+                params={"state": "closed", "maxResults": num_sprints * 2},
+                base=JIRA_AGILE)
+    sprints = sorted(data.get("values", []),
+                     key=lambda s: s.get("endDate", ""), reverse=True)[:num_sprints]
+    sprints = list(reversed(sprints))  # ordem cronologica: mais antigo primeiro
+
+    dev_sprints = defaultdict(list)
+
+    for sprint in sprints:
+        stories = _get_sprint_stories(board_id, sprint["id"])
+        if not stories:
+            continue
+
+        # Uma chamada JQL para todas as subtarefas do sprint
+        story_keys = [s["key"] for s in stories]
+        sub_time   = _get_sprint_subtask_time(story_keys)
+
+        by_dev = defaultdict(lambda: {
+            "committed": 0, "done": 0,
+            "story_sizes_h": [], "spent_per_story_h": [],
+            "mape_samples": [], "overrun_count": 0, "no_estimate": 0,
+        })
+
+        for s in stories:
+            f        = s["fields"]
+            assignee = (f.get("assignee") or {}).get("displayName")
+            if not assignee:
+                continue
+            cat = f["status"]["statusCategory"]["key"]
+
+            # Tempo: subtarefas tem prioridade; fallback para campos diretos
+            sub   = sub_time.get(s["key"], {})
+            orig  = sub.get("original_h") or _hours(f.get("timeoriginalestimate") or 0)
+            spent = sub.get("spent_h")    or _hours(f.get("timespent") or 0)
+
+            d = by_dev[assignee]
+            d["committed"] += 1
+            if orig > 0:
+                d["story_sizes_h"].append(orig)
+            else:
+                d["no_estimate"] += 1
+
+            if cat == "done":
+                d["done"] += 1
+                if spent > 0:
+                    d["spent_per_story_h"].append(spent)
+                    if orig > 0:
+                        d["mape_samples"].append(
+                            abs(spent - orig) / orig * 100
+                        )
+                if orig > 0 and spent > orig * 1.2:
+                    d["overrun_count"] += 1
+
+        for assignee, d in by_dev.items():
+            rate     = round(d["done"] / d["committed"] * 100, 1) if d["committed"] else 0
+            avg_size = round(mean(d["story_sizes_h"]), 1) if d["story_sizes_h"] else None
+            avg_lead = round(mean(d["spent_per_story_h"]), 1) if d["spent_per_story_h"] else None
+            avg_mape = round(mean(d["mape_samples"]), 1) if d["mape_samples"] else None
+
+            dev_sprints[assignee].append({
+                "sprint":     sprint.get("name"),
+                "end_date":   sprint.get("endDate", "")[:10],
+                "committed":  d["committed"],
+                "done":       d["done"],
+                "delivery_rate":    rate,
+                "avg_story_size_h": avg_size,
+                "avg_lead_time_h":  avg_lead,
+                "sprint_mape":      avg_mape,
+                "overrun_count":    d["overrun_count"],
+                "no_estimate":      d["no_estimate"],
+            })
+
+    results = {}
+    for dev, sprint_list in dev_sprints.items():
+        if len(sprint_list) < 2:
+            continue
+
+        rates      = [s["delivery_rate"] for s in sprint_list]
+        throughputs = [s["done"]         for s in sprint_list]
+        sizes  = [s["avg_story_size_h"]  for s in sprint_list if s["avg_story_size_h"]]
+        leads  = [s["avg_lead_time_h"]   for s in sprint_list if s["avg_lead_time_h"]]
+        mapes  = [s["sprint_mape"]       for s in sprint_list if s["sprint_mape"] is not None]
+
+        total_done    = sum(s["done"]           for s in sprint_list)
+        total_overrun = sum(s["overrun_count"]  for s in sprint_list)
+        total_no_est  = sum(s["no_estimate"]    for s in sprint_list)
+        total_committed = sum(s["committed"]    for s in sprint_list)
+
+        avg_rate  = round(mean(rates), 1)
+        std_rate  = round(stdev(rates), 1) if len(rates) > 1 else 0
+        avg_tput  = round(mean(throughputs), 1)
+        std_tput  = round(stdev(throughputs), 1) if len(throughputs) > 1 else 0
+        avg_size  = round(mean(sizes), 1) if sizes else None
+        avg_lead  = round(mean(leads), 1) if leads else None
+        avg_mape  = round(mean(mapes), 1) if mapes else None
+        overrun_rate = round(total_overrun / total_done * 100, 1) if total_done else None
+        no_est_rate  = round(total_no_est / total_committed * 100, 1) if total_committed else None
+
+        # Confianca de entrega
+        if avg_rate >= 85 and std_rate <= 10:
+            confianca = "ALTA"
+        elif avg_rate >= 70 and std_rate <= 20:
+            confianca = "MEDIA"
+        elif avg_rate >= 50:
+            confianca = "BAIXA"
+        else:
+            confianca = "CRITICA"
+
+        # Precisao de estimativa
+        if avg_mape is None:
+            precisao = "SEM_DADOS"
+        elif avg_mape <= 20:
+            precisao = "PRECISO"
+        elif avg_mape <= 40:
+            precisao = "ACEITAVEL"
+        elif avg_mape <= 70:
+            precisao = "IMPRECISO"
+        else:
+            precisao = "MUITO_IMPRECISO"
+
+        # Tendencia: primeiro terco vs ultimo terco dos sprints
+        n   = len(sprint_list)
+        cut = max(1, n // 3)
+        early_avg  = mean([s["delivery_rate"] for s in sprint_list[:cut]])
+        recent_avg = mean([s["delivery_rate"] for s in sprint_list[-cut:]])
+        delta = round(recent_avg - early_avg, 1)
+        if delta >= 10:
+            trend = f"MELHORANDO (+{delta}%)"
+        elif delta <= -10:
+            trend = f"PIORANDO ({delta}%)"
+        else:
+            trend = f"ESTAVEL ({'+' if delta >= 0 else ''}{delta}%)"
+
+        results[dev] = {
+            "sprints_analisados":       len(sprint_list),
+            "throughput_medio":         f"{avg_tput} hist/sprint (±{std_tput})",
+            "taxa_entrega_media":       f"{avg_rate}%",
+            "variacao_entrega":         f"±{std_rate}%",
+            "confianca_entrega":        confianca,
+            "tendencia":                trend,
+            "tamanho_medio_historia":   _fmt_time(avg_size) if avg_size else "—",
+            "lead_time_medio":          _fmt_time(avg_lead) if avg_lead else "—",
+            "erro_estimativa_mape":     f"{avg_mape}%" if avg_mape is not None else "—",
+            "precisao_estimativa":      precisao,
+            "taxa_overrun":             f"{overrun_rate}%" if overrun_rate is not None else "—",
+            "sem_estimativa":           f"{no_est_rate}%" if no_est_rate is not None else "—",
+            "historico_sprints":        sprint_list,
+        }
+
+    order = {"ALTA": 0, "MEDIA": 1, "BAIXA": 2, "CRITICA": 3}
+    return dict(sorted(
+        results.items(),
+        key=lambda x: (order.get(x[1]["confianca_entrega"], 4),
+                       -float(x[1]["taxa_entrega_media"].replace("%", "") or 0))
+    ))
+
+
 def _get_developer_sprint_data(board_id: int, sprint) -> dict:
     """Extrai dados de um sprint por desenvolvedor (historias, conclusao, estimativas)."""
     stories   = _get_sprint_stories(board_id, sprint["id"])
