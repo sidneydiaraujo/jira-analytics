@@ -15,6 +15,56 @@ JIRA_AGILE = "https://qx3prod.atlassian.net/rest/agile/1.0"
 PROJECTS   = ["TPROJ", "TNP", "TLIGHTDIST", "TLIGHTCOM", "THP",
               "TTRD", "TSRV", "PROJTHUN", "SUP", "TVAR"]
 
+# Configuracao do usuario — carregada sob demanda
+try:
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    import config_manager as _cfg
+except ImportError:
+    _cfg = None
+
+
+def resolve_board(name_or_id) -> int:
+    """Resolve nome ou alias de board para ID numerico. Ex: 'projetos' -> 86."""
+    if _cfg:
+        bid = _cfg.resolve_board(name_or_id)
+        if bid is not None:
+            return bid
+    try:
+        return int(name_or_id)
+    except (ValueError, TypeError):
+        raise ValueError(f"Board '{name_or_id}' nao encontrado na configuracao do usuario.")
+
+
+def default_board() -> int:
+    """Retorna o board padrao configurado pelo usuario (fallback: 86)."""
+    return _cfg.get_default_board() if _cfg else 86
+
+
+def get_user_config() -> dict:
+    """Retorna a configuracao completa do usuario."""
+    return _cfg.load() if _cfg else {}
+
+
+def update_user_config(action: str, **kwargs):
+    """Atualiza a configuracao do usuario.
+
+    Actions:
+      add_board(alias, board_id)      — adiciona alias de board
+      remove_board(alias)             — remove alias
+      set_default_board(board_id)     — define board padrao
+      add_developer(name)             — adiciona desenvolvedor monitorado
+      remove_developer(name)          — remove desenvolvedor
+      add_topic(topic)                — adiciona assunto de interesse
+      remove_topic(topic)             — remove assunto
+    """
+    if not _cfg:
+        return {"erro": "config_manager nao disponivel"}
+    fn = getattr(_cfg, action, None)
+    if not fn:
+        return {"erro": f"Acao '{action}' desconhecida"}
+    result = fn(**kwargs)
+    return {"ok": True, "config": result}
+
 # Status que indicam trabalho ativo (para calcular risco de atraso).
 # "Em Testes" NAO esta aqui — significa desenvolvimento concluido neste contexto.
 IN_PROGRESS_STATUSES = {"em andamento", "in progress", "doing", "em desenvolvimento",

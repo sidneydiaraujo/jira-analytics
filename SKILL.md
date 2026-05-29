@@ -19,6 +19,59 @@ JIRA_API_TOKEN=<seu-token-de-api>
 
 ---
 
+## Configuração do Usuário (Personalização)
+
+A skill mantém um perfil persistente do usuário em `~/.claude/jira-analytics-user-config.json`.
+
+### O que é armazenado
+
+| Campo | Descrição | Exemplo |
+|---|---|---|
+| `default_board` | Board usado quando o usuário não especifica | `86` |
+| `boards` | Aliases de boards por nome amigável | `"projetos": 86` |
+| `developers` | Desenvolvedores monitorados pelo usuário | `["Anderson", "Felipe", "Vinicios"]` |
+| `topics` | Assuntos de interesse para buscas rápidas | `["CCEE", "garantia"]` |
+
+### Regras de uso automático
+
+- **Board não especificado:** use `default_board()` — nunca pergunte ao usuário qual board ele quer se já foi configurado
+- **Nome de board mencionado** (ex: "board Projetos", "board da Comercializadora"): resolva via `resolve_board(nome)` antes de chamar qualquer função
+- **Desenvolvedores:** quando o usuário disser "meus devs", "o time", "os desenvolvedores" — use a lista `developers` da config
+- **Assunto de interesse:** quando o usuário disser "busca sobre CCEE" sem mais contexto — use `topics` como ponto de partida
+
+### Comandos de atualização
+
+Quando o usuário pedir para salvar/adicionar/remover algo, use `update_user_config()`:
+
+| O usuário diz | Ação |
+|---|---|
+| "salva esse board como meu padrão" | `update_user_config("set_default_board", board_id=86)` |
+| "adiciona o board Light Comercializadora (346)" | `update_user_config("add_board", alias="Light Comercializadora", board_id=346)` |
+| "remove o board Distribuidora" | `update_user_config("remove_board", alias="distribuidora")` |
+| "adiciona o João no meu time" | `update_user_config("add_developer", name="João")` |
+| "remove o Vinicios do meu perfil" | `update_user_config("remove_developer", name="Vinicios")` |
+| "quero acompanhar o assunto CCEE" | `update_user_config("add_topic", topic="CCEE")` |
+| "mostra minha configuração" / "meu perfil" | `get_user_config()` → exibir formatado |
+
+### Como exibir a configuração
+
+```python
+from scripts.config_manager import show_config
+print(show_config())
+```
+
+### Atualização via CLI
+
+```bash
+python scripts/config_manager.py --list
+python scripts/config_manager.py --add-board "Light Comercializadora" 346
+python scripts/config_manager.py --default-board 86
+python scripts/config_manager.py --add-dev "João"
+python scripts/config_manager.py --add-topic "CCEE"
+```
+
+---
+
 ## Regras de Comportamento
 
 - **Sprints:** sempre usar o sprint ativo por padrão. Se não houver sprint ativo, usar o último fechado. O usuário precisa especificar explicitamente se quiser dados de sprints anteriores.
