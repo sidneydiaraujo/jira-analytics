@@ -3,6 +3,7 @@ Jira Analytics — sprints, responsaveis, epicos e consultas livres.
 Reutiliza JIRA_EMAIL + JIRA_API_TOKEN da jira-epic-automator.
 """
 import os
+import re
 import sys
 import requests
 from datetime import date, datetime, timedelta, timezone
@@ -1093,3 +1094,362 @@ def free_query(jql: str,
             "tipo":       (f.get("issuetype") or {}).get("name", ""),
         })
     return {"total": len(rows), "issues": rows}
+
+
+# ---------------------------------------------------------------------------
+# Modulo 5: Pesquisa Avancada de Conteudo
+# ---------------------------------------------------------------------------
+
+_STOPWORDS = {
+    # Portugues
+    "a", "o", "as", "os", "um", "uma", "uns", "umas",
+    "de", "do", "da", "dos", "das", "du", "no", "na", "nos", "nas",
+    "ao", "aos", "as", "pelo", "pela", "pelos", "pelas",
+    "e", "ou", "mas", "nem", "pois", "que", "se", "para",
+    "com", "sem", "em", "por", "ate", "ate", "sob",
+    "ele", "ela", "eles", "elas", "eu", "tu", "nos", "vos",
+    "esse", "essa", "esses", "essas", "este", "esta", "estes", "estas",
+    "aquele", "aquela", "aqueles", "aquelas", "isso", "isto", "aquilo",
+    "seu", "sua", "seus", "suas", "meu", "minha", "meus", "minhas",
+    "foi", "ser", "ter", "tem", "sao", "esta", "estao", "tinha",
+    "como", "quando", "onde", "qual", "quais", "quem",
+    "sobre", "mais", "menos", "muito", "pouco", "bem", "mal",
+    "pode", "deve", "vai", "ira", "devo", "posso",
+    "sim", "nao", "ja", "ainda", "sempre", "nunca",
+    "me", "te", "lhe", "lhes", "nos", "vos",
+    "ha", "ate", "so", "tudo", "todo", "toda", "todos", "todas",
+    "outro", "outra", "outros", "outras", "mesmo", "mesma",
+    # Ingles
+    "the", "a", "an", "is", "are", "was", "were", "be", "been",
+    "in", "on", "at", "to", "of", "for", "and", "or", "not", "it",
+    "this", "that", "these", "those", "with", "from", "by", "as",
+    "have", "has", "had", "will", "would", "could", "should",
+    "its", "their", "our", "your", "my", "his", "her",
+}
+
+# Sinonimos/expansoes para termos de contexto agil
+_TERM_EXPANSIONS = {
+    "criterio": ["criterio", "aceite", "acceptance", "AC:"],
+    "aceite":   ["aceite", "criterio", "acceptance"],
+    "cenario":  ["cenario", "scenario", "dado que", "quando", "entao", "gherkin"],
+    "teste":    ["teste", "test", "cenario", "validacao", "verificacao"],
+    "combinado": ["combinado", "acordado", "decisao", "ficou", "definido", "alinhado"],
+    "decisao":  ["decisao", "decidido", "combinado", "acordado", "definido"],
+    "bug":      ["bug", "erro", "falha", "problema", "issue", "defeito"],
+    "regra":    ["regra", "negocio", "requisito", "rule", "logica"],
+}
+
+
+def _adf_to_text(node) -> str:
+    """Converte Atlassian Document Format (ADF) para texto plano pesquisavel."""
+    if not node:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "\n".join(filter(None, (_adf_to_text(c) for c in node)))
+    if not isinstance(node, dict):
+        return ""
+
+    ntype   = node.get("type", "")
+    text    = node.get("text", "")
+    content = node.get("content", [])
+
+    if text:
+        return text
+
+    if ntype in ("doc", "blockquote"):
+        return "\n\n".join(filter(None, (_adf_to_text(c) for c in content)))
+    if ntype in ("paragraph", "heading"):
+        return " ".join(filter(None, (_adf_to_text(c) for c in content)))
+    if ntype in ("bulletList", "orderedList"):
+        return "\n".join(filter(None, (_adf_to_text(c) for c in content)))
+    if ntype == "listItem":
+        return "- " + " ".join(filter(None, (_adf_to_text(c) for c in content)))
+    if ntype in ("strong", "em", "code", "strike", "underline"):
+        return "".join(_adf_to_text(c) for c in content)
+    if ntype == "link":
+        label = "".join(_adf_to_text(c) for c in content)
+        return label or node.get("attrs", {}).get("href", "")
+    if ntype == "hardBreak":
+        return "\n"
+    if ntype == "rule":
+        return "\n---\n"
+    if ntype == "codeBlock":
+        return "".join(_adf_to_text(c) for c in content)
+    if ntype == "table":
+        return "\n".join(
+            " | ".join(
+                " ".join(filter(None, (_adf_to_text(cell) for cell in row.get("content", []))))
+                for row in content
+            )
+        )
+    if ntype in ("tableRow",):
+        return " | ".join(filter(None, (_adf_to_text(c) for c in content)))
+    if ntype in ("tableCell", "tableHeader"):
+        return " ".join(filter(None, (_adf_to_text(c) for c in content)))
+    if ntype == "mention":
+        return node.get("attrs", {}).get("text", "@mencionado")
+    if ntype == "emoji":
+        return node.get("attrs", {}).get("shortName", "")
+    if ntype == "inlineCard":
+        return "[" + node.get("attrs", {}).get("url", "link") + "]"
+    if ntype == "mediaInline":
+        return "[media]"
+
+    return " ".join(filter(None, (_adf_to_text(c) for c in content)))
+
+
+def _extract_snippet(text: str, terms: list, context: int = 200) -> str:
+    """Extrai trecho contextualizado ao redor da primeira ocorrencia de qualquer termo."""
+    text_l = text.lower()
+    best_idx = -1
+
+    # Prioriza termos mais longos (mais especificos)
+    for term in sorted(terms, key=len, reverse=True):
+        idx = text_l.find(term.lower())
+        if idx >= 0:
+            best_idx = idx
+            break
+
+    if best_idx < 0:
+        return (text[:context] + "…") if len(text) > context else text
+
+    start = max(0, best_idx - context // 2)
+    end   = min(len(text), best_idx + context // 2)
+
+    # Ajustar para nao cortar no meio de palavras
+    if start > 0:
+        start = text.rfind(" ", 0, start) + 1
+    if end < len(text):
+        end = text.find(" ", end)
+        if end < 0:
+            end = len(text)
+
+    snippet = text[start:end].strip()
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet = snippet + "…"
+    return snippet
+
+
+def _parse_natural_query(query: str) -> dict:
+    """Extrai termos e metadados de uma query em linguagem natural (portugues/ingles).
+
+    Retorna:
+      terms: lista de termos para busca
+      phrases: frases exatas entre aspas
+      days_filter: int ou None
+      field_hints: campos sugeridos com base em palavras-chave
+    """
+    # Extrair frases exatas entre aspas
+    phrases = re.findall(r'"([^"]+)"', query)
+    clean   = re.sub(r'"[^"]+"', " ", query)
+
+    # Detectar filtro de data na query
+    days_filter = None
+    m = re.search(r'(?:ultim[oa]s?\s+)?(\d+)\s+dias?', clean, re.I)
+    if m:
+        days_filter = int(m.group(1))
+        clean = clean[:m.start()] + clean[m.end():]
+    elif re.search(r'esta\s+semana', clean, re.I):
+        days_filter = 7
+        clean = re.sub(r'esta\s+semana', " ", clean, flags=re.I)
+    elif re.search(r'este\s+m[eê]s', clean, re.I):
+        days_filter = 30
+        clean = re.sub(r'este\s+m[eê]s', " ", clean, flags=re.I)
+
+    # Field hints
+    field_hints = []
+    q_lower = clean.lower()
+    if any(w in q_lower for w in ["comentario", "comentários", "combinado", "acordado",
+                                   "decisao", "comment", "alinhado", "definido"]):
+        field_hints.append("comment")
+    if any(w in q_lower for w in ["criterio", "aceite", "acceptance", "ac:", "descricao",
+                                   "cenario", "scenario", "gherkin", "dado que"]):
+        field_hints.append("description")
+
+    # Tokenizar e remover stopwords
+    tokens = re.sub(r"[^\w\sáéíóúâêôãõàçüñ]", " ", clean, flags=re.U).split()
+    original_terms = []
+    expanded_terms = []
+
+    for t in tokens:
+        t_norm = t.lower().strip()
+        if len(t_norm) >= 3 and t_norm not in _STOPWORDS:
+            if t_norm not in original_terms:
+                original_terms.append(t_norm)
+            # Coletar expansoes separadamente (usadas apenas para ranking local)
+            for key, expansions in _TERM_EXPANSIONS.items():
+                if t_norm == key or t_norm.startswith(key[:5]):
+                    for e in expansions:
+                        if e not in original_terms and e not in expanded_terms:
+                            expanded_terms.append(e)
+                    break
+
+    # Frases exatas entram como termos originais prioritarios
+    for phrase in phrases:
+        if phrase not in original_terms:
+            original_terms.insert(0, phrase)
+
+    return {
+        "terms":         original_terms,         # usados no JQL
+        "expanded":      expanded_terms,          # usados apenas para ranking local
+        "phrases":       phrases,
+        "days_filter":   days_filter,
+        "field_hints":   field_hints,
+    }
+
+
+def _build_search_jql(parsed: dict, project_keys: list, days: int = None) -> str:
+    """Constroi JQL otimizado a partir dos termos parseados.
+
+    Estrategia:
+    - Frases exatas (entre aspas) → text ~ '"frase exata"'
+    - Sem frase: 1 ancora principal (termo mais longo e especifico) com AND
+      + 1 termo secundario opcional
+    - Nunca mais de 2 termos com AND em text~ para evitar zero resultados
+    - Campo especifico (description/comment) so se houver hint E o termo
+      tem >= 6 chars (especifico o suficiente)
+    - Expandidos sao usados apenas para ranking local, nao no JQL
+    """
+    proj = f'project in ({",".join(project_keys)})'
+
+    phrases      = parsed["phrases"]
+    all_terms    = parsed["terms"]   # ja sao os originais, sem expandidos
+    hints        = parsed["field_hints"]
+    days_filter  = days or parsed.get("days_filter")
+
+    # Selecionar termos ancora: os 2 mais longos (mais especificos) dos originais
+    anchor_terms = sorted(set(all_terms), key=len, reverse=True)[:2]
+
+    clauses = []
+
+    if phrases:
+        # Frase exata: altissima precisao
+        for phrase in phrases:
+            clauses.append(f'text ~ "\\"{phrase}\\""')
+    elif hints and anchor_terms:
+        # Busca com campo especifico + fallback geral
+        # Usa o campo sugerido com o termo principal
+        field_parts = []
+        for field in hints[:1]:  # apenas o primeiro hint para nao complicar
+            field_parts.append(f'{field} ~ "{anchor_terms[0]}"')
+        # Adiciona busca geral (text) para nao perder nada
+        general_parts = [f'text ~ "{t}"' for t in anchor_terms[:2]]
+        combined = " OR ".join(
+            [("(" + " AND ".join(field_parts) + ")")] + [("(" + " AND ".join(general_parts) + ")")]
+        )
+        clauses.append(combined)
+    else:
+        # Busca geral com 1-2 termos em AND
+        text_parts = [f'text ~ "{t}"' for t in anchor_terms[:2]]
+        clauses.append(" AND ".join(text_parts))
+
+    date_clause = ""
+    if days_filter:
+        since = (date.today() - timedelta(days=days_filter)).isoformat()
+        date_clause = f' AND updated >= "{since}"'
+
+    jql_body = " AND ".join(clauses) if clauses else f'text ~ "{all_terms[0]}"'
+    return f"{proj} AND ({jql_body}){date_clause} ORDER BY updated DESC"
+
+
+def search_content(query: str, project_keys=None, days: int = None,
+                   max_results: int = 20) -> dict:
+    """Pesquisa avancada em descricoes, criterios de aceite, cenarios e comentarios.
+
+    Aceita linguagem natural em portugues ou ingles.
+    Retorna resultados com trechos contextualizados, campo de origem e datas.
+
+    Exemplos de queries:
+      - "como foi combinada a regra de calculo do CCEE"
+      - "criterio de aceite para fatura de venda"
+      - "cenarios de teste do campo de migracao"
+      - "o que foi decidido sobre garantia nos comentarios"
+      - '"tag contrato" nos ultimos 30 dias'
+    """
+    projects = project_keys or PROJECTS
+    parsed   = _parse_natural_query(query)
+    terms    = parsed["terms"]
+    # Para snippets e match local: usar todos os termos (originais + expandidos)
+    all_terms_local = terms + parsed.get("expanded", [])
+
+    if not terms:
+        return {"erro": "Nao foi possivel extrair termos de busca da query informada."}
+
+    jql = _build_search_jql(parsed, projects, days)
+
+    # Buscar com conteudo completo — description + comments
+    issues = _search(
+        jql,
+        "summary,status,assignee,issuetype,created,updated,priority,description,comment",
+        max_results=max_results
+    )
+
+    results = []
+    for issue in issues:
+        f    = issue["fields"]
+        key  = issue["key"]
+
+        # Extrair texto da descricao (ADF)
+        desc_text = _adf_to_text(f.get("description"))
+
+        # Extrair comentarios com metadados
+        raw_comments = (f.get("comment") or {}).get("comments", [])
+        comments = [
+            {
+                "author": (c.get("author") or {}).get("displayName", "?"),
+                "date":   c.get("created", "")[:16].replace("T", " "),
+                "text":   _adf_to_text(c.get("body")),
+            }
+            for c in raw_comments
+        ]
+        total_comments = (f.get("comment") or {}).get("total", len(comments))
+
+        # Encontrar matches por campo
+        matches = []
+
+        # 1. Descricao
+        if desc_text and any(t.lower() in desc_text.lower() for t in all_terms_local):
+            matches.append({
+                "campo":  "descricao",
+                "trecho": _extract_snippet(desc_text, all_terms_local),
+            })
+
+        # 2. Comentarios
+        for c in comments:
+            if any(t.lower() in c["text"].lower() for t in all_terms_local):
+                matches.append({
+                    "campo":  f'comentario — {c["author"]} ({c["date"]})',
+                    "trecho": _extract_snippet(c["text"], all_terms_local),
+                })
+
+        # 3. Resumo (fallback se nao achou nos outros campos)
+        if not matches:
+            matches.append({
+                "campo":  "resumo",
+                "trecho": f.get("summary", ""),
+            })
+
+        results.append({
+            "key":         key,
+            "resumo":      f.get("summary", ""),
+            "tipo":        (f.get("issuetype") or {}).get("name", ""),
+            "status":      (f.get("status") or {}).get("name", ""),
+            "responsavel": (f.get("assignee") or {}).get("displayName", "—"),
+            "criado":      f.get("created", "")[:10],
+            "atualizado":  f.get("updated", "")[:10],
+            "total_comentarios": total_comments,
+            "matches":     matches,
+        })
+
+    return {
+        "query":         query,
+        "termos_usados": terms,
+        "expandidos":    parsed.get("expanded", []),
+        "jql_gerado":    jql,
+        "total":         len(results),
+        "resultados":    results,
+    }
