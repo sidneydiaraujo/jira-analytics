@@ -1,6 +1,6 @@
 ---
 name: jira-analytics
-description: "Analise inteligente de dados do Jira para os projetos TPROJ, TNP, TLIGHTDIST, TLIGHTCOM, THP, TTRD, TSRV, PROJTHUN, SUP e TVAR. Use esta skill sempre que o usuario quiser entender, analisar ou consultar dados do Jira — sem alterar nada. Acione para perguntas como: 'como esta o sprint?', 'quem esta sobrecarregado?', 'qual a velocidade do time?', 'quais epicos estao em risco?', 'mostre o progresso do TPROJ-123', 'quem entregou mais historias?', 'qual sprint foi o melhor?', 'tem algum epico sem responsavel?', 'qual a taxa de conclusao?', 'quais historias tem risco de atraso?', 'como esta a confianca de entrega do time?', 'quanto tempo cada historia passou em cada status?', ou qualquer consulta analitica sobre sprints, responsaveis, epicos ou issues no Jira. Esta skill e somente leitura — nao altera nenhum dado."
+description: "Analise inteligente de dados do Jira para os projetos TPROJ, TNP, TLIGHTDIST, TLIGHTCOM, THP, TTRD, TSRV, PROJTHUN, SUP e TVAR. Use esta skill sempre que o usuario quiser entender, analisar ou consultar dados do Jira — sem alterar nada. Acione para perguntas como: 'como esta o sprint?', 'quem esta sobrecarregado?', 'qual a velocidade do time?', 'quais epicos estao em risco?', 'mostre o progresso do TPROJ-123', 'quem entregou mais historias?', 'qual sprint foi o melhor?', 'tem algum epico sem responsavel?', 'qual a taxa de conclusao?', 'quais historias tem risco de atraso?', 'como esta a confianca de entrega do time?', 'quanto tempo cada historia passou em cada status?', 'qual o criterio de aceite de X?', 'o que foi combinado sobre Y?', 'tem algum cenario de teste para Z?', 'busca nas descricoes sobre migração', ou qualquer consulta analitica ou busca de conteudo sobre sprints, responsaveis, epicos, issues ou funcionalidades no Jira. Esta skill e somente leitura — nao altera nenhum dado."
 ---
 
 # Jira Analytics
@@ -133,6 +133,51 @@ Progresso detalhado de um épico específico (separa histórias de subtarefas):
 
 ---
 
+### Módulo 5 — Pesquisa Avançada de Conteúdo
+
+**Gatilhos:** "critério de aceite", "cenário de teste", "o que foi combinado", "o que foi decidido", "busca nas descrições", "tem algo sobre X", "o que está escrito sobre", "acordo nos comentários", "regra de negócio de", qualquer busca por conteúdo dentro de issues
+
+#### `search_content(query, project_keys=None, days=None, max_results=20)`
+
+Pesquisa em linguagem natural dentro do conteúdo completo dos issues:
+- **Descrições** — regras de negócio, requisitos, detalhamento da funcionalidade
+- **Critérios de aceite** — textos AC:, acceptance criteria, blocos de aceite
+- **Cenários de teste** — BDD/Gherkin, Dado que / Quando / Então, cenários descritos
+- **Comentários** — decisões, combinados, alinhamentos, histórico de discussões
+
+**Como funciona:**
+1. Parser de linguagem natural extrai termos relevantes, remove stopwords PT/EN
+2. Detecta filtros de data na query: *"últimos 30 dias"*, *"esta semana"*, *"este mês"*
+3. Detecta campo-alvo: palavras como *"comentário"*, *"combinado"* → prioriza `comment`; *"critério"*, *"cenário"* → prioriza `description`
+4. Expande sinônimos contextuais para ranking local (não afetam o JQL)
+5. Gera JQL inteligente com 1–2 termos âncora (evita zero resultados)
+6. Retorna resultado com trecho contextualizado e indicação do campo onde foi encontrado
+
+**Parâmetros:**
+- `query` — pergunta em linguagem natural ou palavras-chave (suporta aspas para frase exata: `'"tag contrato"'`)
+- `days` — limitar a issues atualizados nos últimos N dias (também detectado na query)
+- `project_keys` — lista de projetos específicos; se omitido, busca em todos os 10 projetos
+- `max_results` — padrão 20
+
+**Formato do resultado por issue:**
+```
+key, resumo, tipo, status, responsavel, criado, atualizado, total_comentarios
+matches: [{campo, trecho}]  ← campo pode ser "descricao", "comentario — Autor (data)"
+```
+
+**Exemplos de queries:**
+```
+"critério de aceite para o campo contrato CCEE"
+"o que foi combinado sobre fatura de venda"
+"cenário de teste para migração de ativo"
+'"tag contrato" nos últimos 30 dias'
+"decisão sobre regra de garantia nos comentários"
+"o que foi alinhado sobre integração CCEE"
+"BDD para o cadastro da gestora"
+```
+
+---
+
 ### Módulo 4 — Consulta Livre
 
 **Gatilhos:** qualquer pergunta que não se encaixe nos módulos acima, ou quando o usuário quer buscar por critérios específicos
@@ -182,6 +227,7 @@ Módulos de análise reutilizáveis:
 - `get_epics_health(project_keys)` — diagnóstico de épicos
 - `get_epic_progress(epic_key)` — progresso de um épico (histórias vs subtarefas)
 - `free_query(jql, fields, max_results)` — consulta JQL livre
+- `search_content(query, project_keys, days, max_results)` — pesquisa em linguagem natural em descrições, critérios, cenários e comentários
 
 ---
 
@@ -202,6 +248,11 @@ Módulos de análise reutilizáveis:
 | "Qual o progresso do TPROJ-123?" | `get_epic_progress("TPROJ-123")` |
 | "Tem bugs abertos sem responsável?" | `free_query` com JQL adequado |
 | "Quais histórias estão atrasadas no sprint?" | `free_query` com `duedate < now()` |
+| "Qual o critério de aceite para o campo CCEE?" | `search_content` — snippet da descrição com o trecho exato |
+| "O que foi combinado sobre a fatura de venda?" | `search_content` — snippets de comentários com autor e data |
+| "Tem cenário de teste para migração de ativo?" | `search_content` — busca com hint de campo `description` |
+| "O que foi decidido sobre garantia nos comentários?" | `search_content` com `field_hint=comment` |
+| "Busca 'tag contrato' nos últimos 30 dias" | `search_content` com frase exata e filtro de data |
 
 ---
 
