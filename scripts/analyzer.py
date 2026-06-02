@@ -5,8 +5,15 @@ Reutiliza JIRA_EMAIL + JIRA_API_TOKEN da jira-epic-automator.
 import os
 import re
 import sys
-import requests
+import subprocess
 from datetime import date, datetime, timedelta, timezone
+
+try:
+    import requests
+except ImportError:
+    print("Instalando dependencia 'requests'...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "-q"])
+    import requests
 from collections import defaultdict
 from statistics import mean, stdev
 

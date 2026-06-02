@@ -9,8 +9,8 @@ Skill do Claude Code que analisa dados do Jira em linguagem natural. Responde pe
 ## O que essa skill faz
 
 - **Relatório de sprint** — taxa de conclusão, story points, histórias por status
-- **Risco de atraso** — classifica histórias como CRITICO / ALTO / MEDIO / BAIXO com base em estimativas e subtarefas
-- **Métricas por desenvolvedor** — taxa de entrega, MAPE, confiança (ALTA/MEDIA/BAIXA/CRITICA), tendência ao longo de sprints
+- **Risco de atraso** — classifica histórias como CRITICO / ALTO / MEDIO / BAIXO com base em estimativas e tempo no status
+- **Métricas por desenvolvedor** — taxa de entrega, MAPE, confiança (ALTA/MEDIA/BAIXA/CRITICA) ao longo de sprints
 - **Saúde dos épicos** — detecta campos faltando, garantia vencida, épicos sem responsável
 - **Pesquisa de conteúdo** — busca em linguagem natural dentro de descrições, critérios de aceite, cenários de teste e comentários
 
@@ -18,11 +18,12 @@ Skill do Claude Code que analisa dados do Jira em linguagem natural. Responde pe
 
 ## Pré-requisitos
 
-- [Claude Code](https://claude.ai/code) instalado
-- Python 3.8 ou superior
-- Biblioteca `requests`: `pip install requests`
+- [Claude Code](https://claude.ai/code) instalado (desktop, CLI ou extensão de IDE)
+- Python 3.8 ou superior — [baixar em python.org](https://python.org) se não tiver
 - Conta Atlassian com acesso ao Jira (`qx3prod.atlassian.net`)
-- Token de API do Jira ([gerar aqui](https://id.atlassian.com/manage-profile/security/api-tokens))
+- Token de API do Jira — [gerar aqui](https://id.atlassian.com/manage-profile/security/api-tokens)
+
+> A biblioteca `requests` é instalada automaticamente na primeira execução.
 
 ---
 
@@ -46,26 +47,39 @@ git clone https://github.com/sidneydiaraujo/jira-analytics
 
 ### 2. Configure as variáveis de ambiente
 
-Abra (ou crie) o arquivo `~/.claude/settings.json` e adicione:
+Localize o arquivo `settings.json` do Claude Code:
+
+| Sistema | Caminho |
+|---|---|
+| Windows | `C:\Users\<seu-usuario>\.claude\settings.json` |
+| macOS / Linux | `~/.claude/settings.json` |
+
+**Se o arquivo não existir**, crie-o com este conteúdo:
 
 ```json
 {
   "env": {
-    "JIRA_EMAIL": "seu-email@empresa.com",
+    "JIRA_EMAIL": "seu-email@thunders.com.br",
     "JIRA_API_TOKEN": "seu-token-de-api-aqui"
   }
 }
 ```
 
-> **Como gerar o token:** acesse https://id.atlassian.com/manage-profile/security/api-tokens → "Create API token"
+**Se o arquivo já existir** (você já tem outras skills ou configurações), **adicione apenas o bloco `env`** sem apagar o restante:
 
-### 3. Instale as dependências Python
-
-```bash
-pip install requests
+```json
+{
+  "model": "sonnet",
+  "env": {
+    "JIRA_EMAIL": "seu-email@thunders.com.br",
+    "JIRA_API_TOKEN": "seu-token-de-api-aqui"
+  }
+}
 ```
 
-### 4. Reinicie o Claude Code
+> ⚠️ Nunca substitua o arquivo inteiro — isso apaga configurações existentes de outras skills.
+
+### 3. Reinicie o Claude Code
 
 Feche e reabra o Claude Code para carregar a skill.
 
@@ -84,7 +98,6 @@ Basta perguntar naturalmente no chat do Claude Code:
 "Qual o progresso do épico TPROJ-123?"
 "Tem algum critério de aceite para o campo CCEE?"
 "O que foi combinado sobre a fatura de venda?"
-"Busca cenário de teste para migração de ativo"
 ```
 
 ---
@@ -107,13 +120,24 @@ Basta perguntar naturalmente no chat do Claude Code:
 jira-analytics/
 ├── SKILL.md              # Definição da skill (lida pelo Claude)
 ├── scripts/
-│   └── analyzer.py       # Todos os módulos de análise
+│   ├── analyzer.py       # Todos os módulos de análise
+│   └── config_manager.py # Perfil persistente do usuário (boards, devs, assuntos)
 └── README.md
 ```
 
 ---
 
+## Integração com outras skills Jira
+
+| Skill | Para que serve |
+|---|---|
+| `jira-analytics` | Análise de sprints, métricas de time, saúde de épicos — somente leitura |
+| [`jira-epic-automator`](https://github.com/sidneydiaraujo/jira-epic-automator) | Ciclo de vida de épicos: Quarter, datas, garantia, status |
+| [`jira-dev`](https://github.com/sidneydiaraujo/jira-dev) | Criação e documentação de tickets do dia a dia do time |
+
+---
+
 ## Segurança
 
-- As credenciais ficam em `~/.claude/settings.json` — **nunca** as adicione ao repositório
-- Essa skill é estritamente de leitura — nenhuma chamada de escrita ou transição é feita
+- As credenciais ficam em `settings.json` local — **nunca** as adicione ao repositório
+- Esta skill é estritamente de leitura — nenhuma chamada de escrita ou transição é feita
