@@ -1,6 +1,6 @@
 ---
 name: jira-analytics
-description: "Analise inteligente de dados do Jira para os projetos TPROJ, TNP, TLIGHTDIST, TLIGHTCOM, THP, TTRD, TSRV, PROJTHUN, SUP e TVAR. Use esta skill sempre que o usuario quiser entender, analisar ou consultar dados do Jira — sem alterar nada. Acione para perguntas como: 'como esta o sprint?', 'quem esta sobrecarregado?', 'qual a velocidade do time?', 'quais epicos estao em risco?', 'mostre o progresso do TPROJ-123', 'quem entregou mais historias?', 'qual sprint foi o melhor?', 'tem algum epico sem responsavel?', 'qual a taxa de conclusao?', 'quais historias tem risco de atraso?', 'como esta a confianca de entrega do time?', 'quanto tempo cada historia passou em cada status?', 'qual o criterio de aceite de X?', 'o que foi combinado sobre Y?', 'tem algum cenario de teste para Z?', 'busca nas descricoes sobre migração', ou qualquer consulta analitica ou busca de conteudo sobre sprints, responsaveis, epicos, issues ou funcionalidades no Jira. Esta skill e somente leitura — nao altera nenhum dado."
+description: "Analise inteligente de dados do Jira para os projetos TPROJ, TNP, TLIGHTDIST, TLIGHTCOM, THP, TTRD, TSRV, PROJTHUN, SUP e TVAR. Use esta skill sempre que o usuario quiser entender, analisar ou consultar dados do Jira — sem alterar nada. Acione para perguntas como: 'como esta o sprint?', 'quem esta sobrecarregado?', 'qual a velocidade do time?', 'quais epicos estao em risco?', 'mostre o progresso do TPROJ-123', 'quem entregou mais historias?', 'qual sprint foi o melhor?', 'tem algum epico sem responsavel?', 'qual a taxa de conclusao?', 'quais historias tem risco de atraso?', 'como esta a confianca de entrega do time?', 'quanto tempo cada historia passou em cada status?', 'qual o criterio de aceite de X?', 'o que foi combinado sobre Y?', 'tem algum cenario de teste para Z?', 'busca nas descricoes sobre migração', 'qual PR foi feito para essa historia?', 'que codigo foi implementado no TSRV-123?', 'tem PR aberto para esse item?', 'qual branch foi usada?', 'quais commits foram feitos?', ou qualquer consulta analitica, busca de conteudo ou rastreamento de codigo sobre sprints, responsaveis, epicos, issues, PRs e funcionalidades no Jira. Esta skill e somente leitura — nao altera nenhum dado."
 ---
 
 # Jira Analytics
@@ -231,6 +231,51 @@ matches: [{campo, trecho}]  ← campo pode ser "descricao", "comentario — Auto
 
 ---
 
+### Módulo 6 — PRs e Código
+
+**Gatilhos:** "PR relacionado", "pull request", "qual código foi implementado", "branch", "commit", "o que foi desenvolvido", "rastrear código", "qual PR fechou essa história", "tem PR associado"
+
+#### `get_issue_prs(issue_key)`
+Retorna todos os artefatos de código vinculados a um issue. O ambiente usa **Azure DevOps** para código.
+
+Fontes consultadas (em ordem):
+1. **Dev-Status API (Bitbucket)** — PRs, commits e branches via integração Jira-Bitbucket (`/rest/dev-status/latest/issue/detail`)
+2. **Campo GMUD** (`customfield_11536`) — link para a página wiki do Azure DevOps com a documentação de deploy/mudança da feature
+3. **Remote Issue Links** — links colados manualmente via "Vincular" no Jira
+4. **Fallback textual** — busca regex por URLs de PR/commit do Azure DevOps, Bitbucket, GitHub ou GitLab na descrição e comentários do issue
+
+Retorna:
+- `pull_requests` — PRs do Bitbucket (quando integração ativa)
+- `commits` / `branches` — do Bitbucket
+- `remote_links` — inclui o link GMUD (type: "gmud") com URL da wiki Azure DevOps
+- `text_links` — URLs de PR/commit encontradas no texto
+
+> **Nota:** A maioria dos épicos tem o campo GMUD preenchido. Para histórias/subtarefas, o link pode estar nos comentários ou remote links.
+
+#### `get_prs_for_stories(issue_keys)`
+Busca PRs em batch para uma lista de issues. Útil para verificar quais histórias de um sprint têm PR associado.
+- Retorna `[{key, total_prs, total_commits, prs, branches, remote_links}]`
+
+#### `find_story_by_pr_pattern(issue_key, pr_url_pattern=None)`
+Visão consolidada de rastreabilidade de código para um issue:
+- Informações do issue (resumo, status, responsável)
+- Resumo: total de PRs, PRs merged, PRs abertos, commits, branches
+- Detalhe completo de cada artefato
+- Aceita filtro opcional por padrão de URL (ex: nome do repositório)
+
+**Exemplos de uso:**
+
+| O usuário pergunta | Ação |
+|---|---|
+| "Qual PR implementou o TSRV-1263?" | `get_issue_prs("TSRV-1263")` |
+| "Quais histórias do sprint têm PR?" | `get_prs_for_stories([lista de keys])` |
+| "Mostre o código implementado no TPROJ-9651" | `find_story_by_pr_pattern("TPROJ-9651")` |
+| "Tem PR aberto para o TLIGHTCOM-555?" | `get_issue_prs` — filtra `status != MERGED` |
+| "Qual branch foi usada no TSRV-1264?" | `get_issue_prs` — campo `branches` |
+| "Quais commits foram feitos no TPROJ-7460?" | `find_story_by_pr_pattern` — campo `commits` |
+
+---
+
 ### Módulo 4 — Consulta Livre
 
 **Gatilhos:** qualquer pergunta que não se encaixe nos módulos acima, ou quando o usuário quer buscar por critérios específicos
@@ -281,6 +326,9 @@ Módulos de análise reutilizáveis:
 - `get_epic_progress(epic_key)` — progresso de um épico (histórias vs subtarefas)
 - `free_query(jql, fields, max_results)` — consulta JQL livre
 - `search_content(query, project_keys, days, max_results)` — pesquisa em linguagem natural em descrições, critérios, cenários e comentários
+- `get_issue_prs(issue_key)` — PRs, commits e branches vinculados a um issue via Jira-GitHub
+- `get_prs_for_stories(issue_keys)` — PRs em batch para uma lista de issues
+- `find_story_by_pr_pattern(issue_key, pr_url_pattern)` — visão consolidada de rastreabilidade de código
 
 ---
 

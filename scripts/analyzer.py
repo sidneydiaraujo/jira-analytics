@@ -17,8 +17,9 @@ except ImportError:
 from collections import defaultdict
 from statistics import mean, stdev
 
-JIRA_BASE  = "https://qx3prod.atlassian.net/rest/api/3"
-JIRA_AGILE = "https://qx3prod.atlassian.net/rest/agile/1.0"
+JIRA_BASE   = "https://qx3prod.atlassian.net/rest/api/3"
+JIRA_AGILE  = "https://qx3prod.atlassian.net/rest/agile/1.0"
+JIRA_DEVINFO = "https://qx3prod.atlassian.net/rest/dev-status/latest"
 PROJECTS   = ["TPROJ", "TNP", "TLIGHTDIST", "TLIGHTCOM", "THP",
               "TTRD", "TSRV", "PROJTHUN", "SUP", "TVAR"]
 
@@ -1509,4 +1510,259 @@ def search_content(query: str, project_keys=None, days: int = None,
         "jql_gerado":    jql,
         "total":         len(results),
         "resultados":    results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Modulo 6: PRs e Código — Development Info + Remote Links
+# ---------------------------------------------------------------------------
+
+def _get_issue_numeric_id(issue_key: str) -> str:
+    """Retorna o ID numerico de um issue a partir da chave (ex: TSRV-1263 -> 80084)."""
+    data = _get(f"/issue/{issue_key}", params={"fields": "id"})
+    return data.get("id")
+
+
+def get_issue_prs(issue_key: str) -> dict:
+    """Retorna PRs, commits e branches vinculados a um issue via integração Jira-Bitbucket.
+
+    Usa a Dev-Status API interna do Jira Cloud (applicationType=bitbucket).
+    Inclui também fallback de busca por URLs de PR/commit nos textos do issue.
+
+    Retorna:
+      pull_requests: [{title, status, url, repo, author, created, source_branch, target_branch, merged}]
+      commits: [{message, url, author, date, repo}]
+      branches: [{name, url, repo}]
+      remote_links: [{title, url, type}]  ← links manuais adicionados via "Link" no Jira
+      text_links: [{url, source}]  ← URLs de PR/commit encontradas nos textos (fallback)
+    """
+    issue_id = _get_issue_numeric_id(issue_key)
+    if not issue_id:
+        return {"erro": f"Issue {issue_key} nao encontrado"}
+
+    result = {
+        "issue":         issue_key,
+        "pull_requests": [],
+        "commits":       [],
+        "branches":      [],
+        "remote_links":  [],
+        "text_links":    [],
+    }
+
+    # 1. Dev-Status API — PRs via Bitbucket
+    try:
+        r = requests.get(
+            f"{JIRA_DEVINFO}/issue/detail",
+            auth=_auth(),
+            headers={"Accept": "application/json"},
+            params={"issueId": issue_id, "applicationType": "bitbucket", "dataType": "pullrequest"},
+        )
+        if r.ok:
+            for detail in r.json().get("detail", []):
+                for pr in detail.get("pullRequests", []):
+                    result["pull_requests"].append({
+                        "title":         pr.get("name", ""),
+                        "status":        pr.get("status", ""),
+                        "url":           pr.get("url", ""),
+                        "repo":          pr.get("repositoryName", ""),
+                        "author":        (pr.get("author") or {}).get("name", "—"),
+                        "created":       (pr.get("lastUpdate") or "")[:16].replace("T", " "),
+                        "source_branch": (pr.get("source") or {}).get("branch", "—"),
+                        "target_branch": (pr.get("destination") or {}).get("branch", "—"),
+                        "merged":        pr.get("status", "").upper() == "MERGED",
+                        "approved":      any(
+                            rev.get("approved") for rev in pr.get("reviewers", [])
+                        ),
+                    })
+    except Exception:
+        pass
+
+    # 2. Dev-Status API — Commits e Branches via Bitbucket
+    try:
+        r = requests.get(
+            f"{JIRA_DEVINFO}/issue/detail",
+            auth=_auth(),
+            headers={"Accept": "application/json"},
+            params={"issueId": issue_id, "applicationType": "bitbucket", "dataType": "repository"},
+        )
+        if r.ok:
+            for detail in r.json().get("detail", []):
+                for commit in detail.get("commits", []):
+                    result["commits"].append({
+                        "message": commit.get("message", "")[:120],
+                        "url":     commit.get("url", ""),
+                        "author":  (commit.get("author") or {}).get("name", "—"),
+                        "date":    (commit.get("authorTimestamp") or "")[:16].replace("T", " "),
+                        "repo":    commit.get("repositoryName", ""),
+                    })
+                for branch in detail.get("branches", []):
+                    result["branches"].append({
+                        "name": branch.get("name", ""),
+                        "url":  branch.get("url", ""),
+                        "repo": branch.get("repositoryName", ""),
+                    })
+    except Exception:
+        pass
+
+    # 3. Remote Issue Links — links manuais colados via "Vincular" no Jira
+    try:
+        remote = _get(f"/issue/{issue_key}/remotelink")
+        for link in (remote if isinstance(remote, list) else []):
+            obj = link.get("object", {})
+            url = obj.get("url", "")
+            result["remote_links"].append({
+                "title": obj.get("title", ""),
+                "url":   url,
+                "type":  link.get("relationship", ""),
+                "is_pr": "pull" in url.lower() or "/pr/" in url.lower(),
+            })
+    except Exception:
+        pass
+
+    # 4. Campo GMUD (customfield_11536) — link de GMUD/wiki de deploy no Azure DevOps
+    try:
+        issue_data = _get(
+            f"/issue/{issue_key}",
+            params={"fields": "description,comment,customfield_11536,summary,status,assignee,issuetype"},
+        )
+        f = issue_data["fields"]
+
+        gmud_val = f.get("customfield_11536")
+        if gmud_val:
+            gmud_text = _adf_to_text(gmud_val) if isinstance(gmud_val, dict) else str(gmud_val)
+            # Extrai URLs do texto do GMUD
+            for url in re.findall(r'https?://[^\s\)\]"\'<>]+', gmud_text):
+                result["remote_links"].append({
+                    "title": "GMUD",
+                    "url":   url.strip(),
+                    "type":  "gmud",
+                    "is_pr": "pullrequest" in url.lower() or "/pr/" in url.lower(),
+                })
+
+        # 5. Fallback — varrer descrição e comentários buscando URLs de PR/commit
+        # Suporta Azure DevOps, Bitbucket, GitHub e GitLab
+        _pr_url_re = re.compile(
+            r'https?://(?:'
+            r'dev\.azure\.com/[^\s\)\]"\'<>]+(?:pullrequest|commit|_git)[^\s\)\]"\'<>]*'
+            r'|bitbucket\.org/[^\s\)\]"\'<>]+(?:pull-requests?|commits?)[^\s\)\]"\'<>]*'
+            r'|github\.com/[^\s\)\]"\'<>]+(?:pulls?|commit)[^\s\)\]"\'<>]*'
+            r'|gitlab\.com/[^\s\)\]"\'<>]+(?:merge_requests?|commit)[^\s\)\]"\'<>]*'
+            r')',
+            re.I,
+        )
+
+        # Descrição
+        desc_text = _adf_to_text(f.get("description"))
+        for url in _pr_url_re.findall(desc_text):
+            result["text_links"].append({"url": url, "source": "descricao"})
+
+        # Comentários
+        for c in (f.get("comment") or {}).get("comments", []):
+            author = (c.get("author") or {}).get("displayName", "?")
+            c_text = _adf_to_text(c.get("body"))
+            for url in _pr_url_re.findall(c_text):
+                result["text_links"].append({
+                    "url":    url,
+                    "source": f"comentario — {author}",
+                })
+
+        # Deduplicar text_links
+        seen = set()
+        deduped = []
+        for item in result["text_links"]:
+            if item["url"] not in seen:
+                seen.add(item["url"])
+                deduped.append(item)
+        result["text_links"] = deduped
+
+    except Exception:
+        pass
+
+    return result
+
+
+def get_prs_for_stories(issue_keys: list) -> list:
+    """Retorna PRs de uma lista de issues em batch.
+
+    Util para verificar quais historias de um sprint tem PR associado.
+    Retorna lista [{key, summary_prs: int, prs: [...]}]
+    """
+    results = []
+    for key in issue_keys:
+        try:
+            pr_data = get_issue_prs(key)
+            results.append({
+                "key":        key,
+                "total_prs":  len(pr_data.get("pull_requests", [])),
+                "total_commits": len(pr_data.get("commits", [])),
+                "prs":        pr_data.get("pull_requests", []),
+                "branches":   pr_data.get("branches", []),
+                "remote_links": [l for l in pr_data.get("remote_links", []) if l.get("is_pr")],
+            })
+        except Exception as e:
+            results.append({"key": key, "erro": str(e)})
+    return results
+
+
+def find_story_by_pr_pattern(issue_key: str, pr_url_pattern: str = None) -> dict:
+    """Dado um issue, retorna todos os artefatos de código relacionados formatados.
+
+    Combina PRs, commits e branches em uma visão consolidada para rastreabilidade.
+    Se pr_url_pattern fornecido, filtra PRs/remote_links que contenham o padrão.
+    """
+    raw = get_issue_prs(issue_key)
+
+    # Informacoes basicas do issue (ja carregadas dentro de get_issue_prs se disponivel)
+    try:
+        issue_data = _get(
+            f"/issue/{issue_key}",
+            params={"fields": "summary,status,assignee,issuetype,customfield_11536"},
+        )
+        f = issue_data["fields"]
+        gmud_val = f.get("customfield_11536")
+        gmud_text = _adf_to_text(gmud_val) if isinstance(gmud_val, dict) else (str(gmud_val) if gmud_val else None)
+        issue_info = {
+            "key":         issue_key,
+            "summary":     f.get("summary", ""),
+            "status":      f["status"]["name"],
+            "assignee":    (f.get("assignee") or {}).get("displayName", "—"),
+            "tipo":        f["issuetype"]["name"],
+            "gmud":        gmud_text,
+        }
+    except Exception:
+        issue_info = {"key": issue_key}
+
+    prs     = raw.get("pull_requests", [])
+    commits = raw.get("commits", [])
+    branches = raw.get("branches", [])
+    remote  = [l for l in raw.get("remote_links", []) if l.get("is_pr")]
+
+    if pr_url_pattern:
+        prs    = [p for p in prs    if pr_url_pattern.lower() in p.get("url", "").lower()]
+        remote = [l for l in remote if pr_url_pattern.lower() in l.get("url", "").lower()]
+
+    # Status resumido
+    merged   = [p for p in prs if p.get("merged")]
+    open_prs = [p for p in prs if not p.get("merged")]
+
+    all_remote = raw.get("remote_links", [])
+    gmud_links = [l for l in all_remote if l.get("type") == "gmud"]
+
+    return {
+        "issue":          issue_info,
+        "resumo": {
+            "total_prs":      len(prs) + len(remote),
+            "prs_merged":     len(merged),
+            "prs_abertos":    len(open_prs),
+            "total_commits":  len(commits),
+            "total_branches": len(branches),
+            "tem_gmud":       bool(issue_info.get("gmud")),
+        },
+        "gmud":           issue_info.get("gmud"),
+        "pull_requests":  prs,
+        "remote_pr_links": remote,
+        "gmud_links":     gmud_links,
+        "commits":        commits[:10],
+        "branches":       branches,
+        "text_links":     raw.get("text_links", []),
     }
