@@ -1,6 +1,6 @@
 ---
 name: jira-analytics
-description: "Analise inteligente de dados do Jira para os projetos TPROJ, TNP, TLIGHTDIST, TLIGHTCOM, THP, TTRD, TSRV, PROJTHUN, SUP e TVAR. Use esta skill sempre que o usuario quiser entender, analisar ou consultar dados do Jira — sem alterar nada. Acione para perguntas como: 'como esta o sprint?', 'quem esta sobrecarregado?', 'qual a velocidade do time?', 'quais epicos estao em risco?', 'mostre o progresso do TPROJ-123', 'quem entregou mais historias?', 'qual sprint foi o melhor?', 'tem algum epico sem responsavel?', 'qual a taxa de conclusao?', 'quais historias tem risco de atraso?', 'como esta a confianca de entrega do time?', 'quanto tempo cada historia passou em cada status?', 'qual o criterio de aceite de X?', 'o que foi combinado sobre Y?', 'tem algum cenario de teste para Z?', 'busca nas descricoes sobre migração', 'qual PR foi feito para essa historia?', 'que codigo foi implementado no TSRV-123?', 'tem PR aberto para esse item?', 'qual branch foi usada?', 'quais commits foram feitos?', ou qualquer consulta analitica, busca de conteudo ou rastreamento de codigo sobre sprints, responsaveis, epicos, issues, PRs e funcionalidades no Jira. Esta skill e somente leitura — nao altera nenhum dado."
+description: "Analise inteligente de dados do Jira e Azure DevOps para os projetos TPROJ, TNP, TLIGHTDIST, TLIGHTCOM, THP, TTRD, TSRV, PROJTHUN, SUP e TVAR. Use esta skill sempre que o usuario quiser entender, analisar ou consultar dados do Jira — sem alterar nada. Acione para perguntas como: 'como esta o sprint?', 'quem esta sobrecarregado?', 'qual a velocidade do time?', 'quais epicos estao em risco?', 'mostre o progresso do TPROJ-123', 'quem entregou mais historias?', 'qual sprint foi o melhor?', 'tem algum epico sem responsavel?', 'qual a taxa de conclusao?', 'quais historias tem risco de atraso?', 'como esta a confianca de entrega do time?', 'quanto tempo cada historia passou em cada status?', 'qual o criterio de aceite de X?', 'o que foi combinado sobre Y?', 'tem algum cenario de teste para Z?', 'busca nas descricoes sobre migração', 'qual PR foi feito para essa historia?', 'que codigo foi implementado no TSRV-123?', 'tem PR aberto para esse item?', 'qual branch foi usada?', 'quais commits foram feitos?', 'analise o ticket X para N1', 'onde foi implementada a funcionalidade Y?', 'em qual PR foi entregue o TSRV-123?', 'quantas horas o Felipe lancou no ultimo mes?', 'qual o total de horas apontadas no TPROJ?', 'quem apontou mais horas esse mes?', 'horas lancadas por pessoa', 'worklog do time', 'quanto o time gastou em teste?', 'horas de QA no sprint', 'tempo em homologacao', 'horas de teste por pessoa', ou qualquer consulta analitica, busca de conteudo, rastreamento de codigo, analise de horas ou analise N1 sobre sprints, responsaveis, epicos, issues, PRs (Jira + Azure DevOps) e funcionalidades. Esta skill e somente leitura — nao altera nenhum dado."
 ---
 
 # Jira Analytics
@@ -310,6 +310,229 @@ A skill analisa a pergunta do usuário, seleciona o módulo adequado, executa as
 
 ---
 
+### Módulo 9 — Worklog Hours: Análise de Horas Apontadas
+
+**Gatilhos:** "quantas horas o X lançou", "horas apontadas no último mês", "total de horas do time", "quem apontou mais horas", "worklog do Felipe", "horas por projeto", "quanto tempo foi lançado em Y", "apontamentos de horas", "quanto tempo o time gastou em teste", "horas de QA", "tempo em homologação"
+
+---
+
+#### Regra de comportamento — quando mostrar horas de teste
+
+- **Só mostrar classificação de teste** (coluna "Teste", % teste, issues de teste) quando o usuário **pedir explicitamente**: "horas de teste", "tempo em QA", "horas em homologação", "atividades de teste", "quanto foi gasto em teste"
+- **Quando o usuário pedir apenas o total de horas** (sem mencionar teste): mostrar somente total, por pessoa e por projeto — sem a coluna de teste
+- **Quando a análise revelar padrão de teste relevante** (ex: >20% do tempo de alguém): sugerir ao usuário que quer ver o detalhamento — **não mostrar automaticamente**
+
+> Exemplo de sugestão: "Tatiana Lima concentrou 17.5% do tempo em atividades de teste. Quer ver o detalhe por issue de teste?"
+
+---
+
+#### Como funciona
+
+Usa a API de worklog em bulk do Jira Cloud:
+1. `GET /worklog/updated?since={ms}` — busca IDs de todos os worklogs do período (paginado)
+2. `POST /worklog/list` — busca detalhes de até 1000 worklogs por requisição
+3. Resolve `issueId → issueKey/projeto/status` via JQL em batch
+4. Agrega por pessoa, projeto e issue
+5. **Classificação de teste** (quando solicitada): verifica status e summary da issue — identifica automaticamente issues de teste pelo nome ("Testes Integrados", "Testes Unitários", "Evidências", "Homologação") e pelo status no Jira
+
+> **Nota sobre comentários:** os worklogs do Jira geralmente não têm comentário preenchido neste time. A classificação de teste usa o nome da issue e o status — não o comentário.
+
+> **Nota sobre nomes compostos:** o filtro de pessoa usa palavras individuais. "Felipe Sartor" encontra "Felipe de Bona Sartor" corretamente.
+
+---
+
+#### `get_worklog_hours(since_days, person, project_keys, keyword)` — horas brutas
+
+| Parâmetro | Tipo | Descrição |
+|---|---|---|
+| `since_days` | int | Período em dias (padrão 30) — ex: 7, 21, 90 |
+| `person` | str | Nome parcial do autor (ex: `"Felipe"`, `"Anderson"`) |
+| `project_keys` | list | Filtrar por projeto (ex: `["TPROJ", "TSRV"]`) |
+| `keyword` | str | Palavra no comentário do worklog (ex: `"teste"`) |
+
+Retorna: `total_horas`, `total_lancamentos`, `por_pessoa[]`, `por_projeto[]`, `por_issue[]`, `detalhes[]`
+
+---
+
+#### `analyze_worklog_hours(since_days, person, project_keys, group_name, classify_test)` — horas com classificação de teste
+
+| Parâmetro | Tipo | Descrição |
+|---|---|---|
+| `since_days` | int | Período em dias (padrão 21) |
+| `person` | str | Nome parcial do autor |
+| `project_keys` | list | Filtrar por projeto (ex: `["TPROJ"]`) |
+| `group_name` | str | Nome do grupo Jira (ex: `"[DEV] Projetos"`) — fallback para projeto se não encontrado |
+| `classify_test` | bool | Se True, classifica cada worklog como teste ou não (padrão True) |
+
+Retorna: `total_horas`, `total_teste`, `pct_teste`, `por_pessoa[]` (com campos `teste` e `pct_teste`), `por_issue_teste[]`, `detalhes_teste[]`, `aviso`
+
+**Critérios de classificação de teste:**
+- Status da issue contém: "em teste", "homologação", "qa", "in review", "validação"
+- Summary da issue contém: "teste", "test", "qa", "homolog", "evidenci", "regressão"
+
+**Fallback de grupo:** se `group_name` não for encontrado via API de grupos, filtra automaticamente pelo `project_keys` informado (ou TPROJ por padrão) e inclui aviso no retorno.
+
+---
+
+#### Exemplos de uso
+
+| O usuário pergunta | Ação |
+|---|---|
+| "Quantas horas o Felipe lançou no último mês?" | `get_worklog_hours(30, person="Felipe")` → mostrar total por pessoa e projeto |
+| "Qual o total de horas do time no TPROJ esta semana?" | `get_worklog_hours(7, project_keys=["TPROJ"])` → mostrar totais |
+| "Quem apontou mais horas esse mês?" | `get_worklog_hours(30)` → ordenar por total decrescente |
+| "Quanto o time gastou em teste nas últimas 3 semanas?" | `analyze_worklog_hours(21, project_keys=["TPROJ"], classify_test=True)` → mostrar coluna teste + % |
+| "Horas de teste do time [DEV] Projetos" | `analyze_worklog_hours(21, group_name="[DEV] Projetos", classify_test=True)` |
+| "Quanto o Felipe gastou em QA no último mês?" | `analyze_worklog_hours(30, person="Felipe Sartor", classify_test=True)` |
+
+---
+
+#### Como apresentar a resposta
+
+**Quando pedido apenas total de horas (sem teste):**
+- Tabela: Pessoa | Total | Lançamentos
+- Tabela: Projeto | Horas | % do total
+- Top 5 issues com mais horas
+- Período consultado
+
+**Quando pedido horas de teste:**
+- Tabela: Pessoa | Total | Teste | % Teste | Lançamentos de teste
+- Issues classificadas como teste (ticket, horas, resumo)
+- Lançamentos de teste dia a dia (quando relevante)
+- Sugerir drill-down se alguma pessoa tiver % muito alta ou muito baixa
+- Se nenhuma hora de teste encontrada: explicar os critérios usados para classificação
+
+**Sugestão proativa (sem pedir):**
+- Ao mostrar horas totais, se uma pessoa tiver >20% do tempo em issues de teste, acrescentar no final: "Tatiana Lima tem 17.5% do tempo em atividades de teste. Quer ver o detalhe?"
+- Não mostrar a tabela de teste completa sem que o usuário peça
+
+---
+
+### Módulo 8 — Análise Estratégica: Miro + Jira
+
+**Gatilhos:** "analise o board Miro", "cruze com o backlog", "o que precisa ser priorizado", "planejamento estratégico vs tickets", "analise a esteira B2B2C", "leia o Miro e cruze com o Jira"
+
+#### Como ler o Miro (dois modos)
+
+**Modo 1 — Conector nativo (preferido em sessões Claude)**
+Use `mcp__claude_ai_Miro__context_get(miro_url=...)` — retorna resumo estruturado gerado por IA com áreas, métricas, objetivos e relações. Disponível quando o plugin Miro está ativo na sessão.
+
+**Modo 2 — REST API (fallback / scripts Python autônomos)**
+Usa `MIRO_API_TOKEN` + `read_miro_board(url_or_id)` — lê todos os itens via paginação (frames, cards, sticky notes, textos). Mais granular, menos interpretado.
+
+**Fluxo recomendado:**
+1. Tente `mcp__claude_ai_Miro__context_get` primeiro (disponível na sessão)
+2. Se não disponível, use `read_miro_board` com o token
+3. Passe o conteúdo extraído para `analyze_strategic_backlog(miro_context=...)` para cruzar com o Jira
+
+#### `read_miro_board(url_or_id)`
+Lê o board via REST API. Retorna: `frames`, `cards`, `sticky_notes`, `texts`, `raw_text`.
+Requer: `MIRO_API_TOKEN` em settings.json.
+
+#### `analyze_strategic_backlog(miro_url, jira_project, since_date, miro_context, ...)`
+Cruzamento Miro + Jira para relatório de priorização.
+
+Parâmetros principais:
+- `miro_url_or_id` — URL/ID do board (usa REST API)
+- `jira_project` — projeto Jira (ex: `"MP"`)
+- `since_date` — data de corte (ex: `"2024-01-01"`)
+- `miro_context` — texto do Miro colado/extraído manualmente (fallback sem token)
+- `max_tickets` — máximo de tickets (padrão 100)
+
+Retorna relatório com: `descricao`, `categoria`, `clientes`, `prioridade`, `status`, `assignee`, `solucao_proposta`.
+
+#### Token Miro
+Configurado em `settings.json` como `MIRO_API_TOKEN`.
+Para obter: [miro.com/app/settings/user-profile/apps](https://miro.com/app/settings/user-profile/apps) → Create app → scope `boards:read` → Install e copiar token.
+
+---
+
+### Módulo 7 — Azure DevOps: PRs, Commits e Análise N1
+
+**Gatilhos:** "em qual PR foi implementado", "qual branch", "qual commit entregou", "onde está o código do TSRV-X", "analise o ticket X", "faça uma análise N1 do TSRV-X", "pesquisa no Azure", "qual PR no Azure"
+
+#### Configuração de credenciais Azure DevOps
+
+Variáveis de ambiente necessárias (além das do Jira):
+
+| Variável | Descrição | Exemplo |
+|---|---|---|
+| `AZURE_DEVOPS_ORG` | Nome da organização no Azure DevOps | `thunderstech` |
+| `AZURE_DEVOPS_PAT` | Personal Access Token com escopo `Code: Read` | `abc123...` |
+| `AZURE_DEVOPS_PROJECT` | Projeto padrão para pesquisa | `ThundersProject` |
+
+> Se as variáveis não estiverem configuradas, as funções Azure retornam vazio e a skill informa que o Azure não está disponível. O restante da skill continua funcionando normalmente com dados do Jira.
+
+#### `search_azure_prs(jira_key, az_project=None)`
+
+Busca PRs no Azure DevOps relacionados a uma chave Jira.
+
+**Estratégia em cascata:**
+1. **Azure DevOps PR Search API** — busca rápida cross-repo por texto livre (requer extensão Code Search habilitada)
+2. **Fallback: varredura de repositórios** — lista todos os repos do projeto e filtra PRs onde título, branch ou descrição contém a chave (client-side, últimos 180 dias)
+
+Retorna: `[{pr_id, title, status, url, repo, author, created, completed, source_branch, target_branch, merged, description, via}]`
+
+#### `search_azure_commits(jira_key, az_project=None, days=90)`
+
+Busca commits cujo commit message menciona a chave Jira.
+
+Usa `searchCriteria.comment` do Azure DevOps (filtro server-side — eficiente). Pesquisa em todos os repositórios do projeto nos últimos `days` dias.
+
+Retorna: `[{commit_id, message, author, date, repo, url}]`
+
+#### `get_azure_pr_files(org, project, repo, pr_id)`
+
+Retorna lista de arquivos alterados em um PR específico do Azure DevOps.
+
+Busca a última iteração do PR (estado final das mudanças). Útil para entender o escopo de implementação.
+
+Retorna: `[{file, change_type}]`
+
+#### `analyze_ticket_n1(issue_key, include_pr_files=False)`
+
+**Função principal do N1.** Combina todas as fontes de dados em um relatório consolidado.
+
+**O que analisa:**
+1. **Jira**: tipo, status, assignee, descrição completa, critérios de aceite, últimos 5 comentários, fix versions, link GMUD
+2. **Hierarquia**: issue pai (história → épico → contexto de negócio)
+3. **Azure DevOps PRs**: busca por chave Jira no título/branch/descrição, com fallback para o épico pai
+4. **Azure DevOps Commits**: commits com a chave no message
+5. **Jira Code**: PRs via Dev-Status API (Bitbucket) + links remotos + URLs nos textos
+6. **GMUD**: link para documentação de deploy/mudança no Azure DevOps Wiki
+
+**Retorna dict com:**
+```
+issue          — resumo, status, assignee, tipo, datas, fix_versions
+hierarquia     — parent_key, parent_summary, parent_status
+descricao      — texto completo (até 2000 chars)
+ultimos_comentarios — últimos 5 comentários com autor e data
+azure          — prs[], commits[], pr_merged_count, disponivel
+jira_code      — pull_requests[], remote_links[], text_links[], commits[]
+gmud           — texto, urls[]
+implementacao  — tem_pr_merged, repos_com_pr[], branches[], merged_em
+```
+
+**Parâmetro `include_pr_files=True`:** adiciona `files_changed` a cada PR Azure (chamada extra por PR — use apenas quando realmente necessário).
+
+---
+
+## Como a Skill Responde ao N1
+
+Quando o usuário pedir análise N1 de um ticket:
+
+1. Chame `analyze_ticket_n1(issue_key)`
+2. Apresente o resultado em formato estruturado:
+   - **Ticket**: tipo, status, responsável, resumo
+   - **Contexto**: épico pai + descrição resumida
+   - **Implementação**: PRs encontrados (Azure + Jira), repos, branches, data de merge
+   - **Deploy**: link GMUD se disponível
+   - **Últimos comentários**: decisões e combinados recentes
+3. Se `azure.disponivel = False`, informe que o Azure não está configurado e mostre apenas os dados do Jira (PRs via Dev-Status + links remotos)
+4. Se nenhum PR for encontrado, avise e sugira pesquisar pelo épico pai ou por commits
+
+---
+
 ## Scripts Disponíveis
 
 ### `scripts/analyzer.py`
@@ -326,9 +549,15 @@ Módulos de análise reutilizáveis:
 - `get_epic_progress(epic_key)` — progresso de um épico (histórias vs subtarefas)
 - `free_query(jql, fields, max_results)` — consulta JQL livre
 - `search_content(query, project_keys, days, max_results)` — pesquisa em linguagem natural em descrições, critérios, cenários e comentários
-- `get_issue_prs(issue_key)` — PRs, commits e branches vinculados a um issue via Jira-GitHub
+- `get_issue_prs(issue_key)` — PRs, commits e branches vinculados a um issue via Jira + remote links
 - `get_prs_for_stories(issue_keys)` — PRs em batch para uma lista de issues
 - `find_story_by_pr_pattern(issue_key, pr_url_pattern)` — visão consolidada de rastreabilidade de código
+- `search_azure_prs(jira_key, az_project)` — PRs no Azure DevOps por chave Jira (Search API + fallback)
+- `search_azure_commits(jira_key, az_project, days)` — commits no Azure com chave no message
+- `get_azure_pr_files(org, project, repo, pr_id)` — arquivos alterados em um PR do Azure
+- `analyze_ticket_n1(issue_key, include_pr_files)` — análise N1 completa: Jira + Azure + GMUD
+- `read_miro_board(url_or_id)` — lê conteudo completo de um board Miro (requer MIRO_API_TOKEN)
+- `analyze_strategic_backlog(miro_url, jira_project, since_date, ...)` — cruzamento Miro + Jira para priorizacao estrategica
 
 ---
 
@@ -354,6 +583,14 @@ Módulos de análise reutilizáveis:
 | "Tem cenário de teste para migração de ativo?" | `search_content` — busca com hint de campo `description` |
 | "O que foi decidido sobre garantia nos comentários?" | `search_content` com `field_hint=comment` |
 | "Busca 'tag contrato' nos últimos 30 dias" | `search_content` com frase exata e filtro de data |
+| "Analise o ticket TSRV-1263 para N1" | `analyze_ticket_n1("TSRV-1263")` |
+| "Em qual PR foi implementado o TLIGHTCOM-987?" | `search_azure_prs("TLIGHTCOM-987")` |
+| "Quais commits mencionam o TPROJ-10395?" | `search_azure_commits("TPROJ-10395")` |
+| "Quais arquivos foram alterados no PR #42?" | `get_azure_pr_files(org, project, repo, 42)` |
+| "Onde está o código da funcionalidade RF029?" | `analyze_ticket_n1` + `search_azure_prs` pelo épico |
+| "Analise o board Miro e cruze com o backlog MP" | `analyze_strategic_backlog(miro_url, "MP", "2024-01-01")` |
+| "O que precisa ser priorizado na esteira B2B2C?" | `analyze_strategic_backlog` — relatorio priorizacao |
+| "Leia o board Miro e identifique os temas estratégicos" | `read_miro_board(url)` — frames + cards + sticky notes |
 
 ---
 
