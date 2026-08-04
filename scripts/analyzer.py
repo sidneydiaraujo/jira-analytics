@@ -107,9 +107,25 @@ def _post(path, body, base=JIRA_BASE):
     return r.json() if r.content else {}
 
 
+def _get_team(f: dict) -> str:
+    """Extrai o nome da célula/time (customfield_10600) de um dict de fields."""
+    team = f.get("customfield_10600")
+    if not team:
+        return "—"
+    if isinstance(team, dict):
+        return team.get("name") or team.get("title") or "—"
+    if isinstance(team, list) and team:
+        t = team[0]
+        return t.get("name") or t.get("title") or "—" if isinstance(t, dict) else str(t)
+    return str(team) if team else "—"
+
+
 def _search(jql, fields, max_results=500):
     results, next_token = [], None
     fields_list = fields if isinstance(fields, list) else fields.split(",")
+    # Garante que o campo Team/Célula sempre vem junto, sem duplicar
+    if "customfield_10600" not in fields_list:
+        fields_list = list(fields_list) + ["customfield_10600"]
     while True:
         payload = {"jql": jql, "fields": fields_list,
                    "maxResults": min(100, max_results)}
@@ -568,6 +584,7 @@ def get_sprint_stories_detail(board_id: int, sprint_id: int = None,
             "summary":           f.get("summary", "")[:80],
             "status":            status_label,
             "assignee":          assignee,
+            "celula":            _get_team(f),
             "subtasks_total":    sub_agg["total_subtasks"],
             # Tempo no status atual formatado
             "tempo_no_status":   _fmt_time(hours_in_status),
@@ -961,15 +978,19 @@ def get_assignee_workload(project_keys=None):
     issues = _search(jql, "summary,status,assignee,customfield_10016,priority")
 
     workload = defaultdict(lambda: {"total": 0, "done": 0, "in_progress": 0,
-                                    "todo": 0, "points": 0, "issues": []})
+                                    "todo": 0, "points": 0, "issues": [],
+                                    "celulas": set()})
     for issue in issues:
         f        = issue["fields"]
         assignee = (f.get("assignee") or {}).get("displayName", "Desconhecido")
         cat      = f["status"]["statusCategory"]["key"]
         pts      = _pts(f.get("customfield_10016"))
+        celula   = _get_team(f)
         workload[assignee]["total"]  += 1
         workload[assignee]["points"] += pts
         workload[assignee]["issues"].append(issue["key"])
+        if celula != "—":
+            workload[assignee]["celulas"].add(celula)
         if cat == "done":
             workload[assignee]["done"] += 1
         elif cat == "indeterminate":
@@ -977,8 +998,12 @@ def get_assignee_workload(project_keys=None):
         else:
             workload[assignee]["todo"] += 1
 
-    return dict(sorted(workload.items(),
-                       key=lambda x: x[1]["total"], reverse=True))
+    # Converte set para lista ordenada antes de retornar
+    result = {}
+    for name, data in sorted(workload.items(), key=lambda x: x[1]["total"], reverse=True):
+        data["celulas"] = sorted(data["celulas"])
+        result[name] = data
+    return result
 
 
 def get_assignee_productivity(assignee_query: str, days: int = 30):
@@ -1011,15 +1036,19 @@ def get_assignee_productivity(assignee_query: str, days: int = 30):
     done_pts = sum(_pts(i["fields"].get("customfield_10016")) for i in done_issues)
     open_pts = sum(_pts(i["fields"].get("customfield_10016")) for i in open_issues)
 
+    # Coleta células únicas dos tickets do responsável
+    celulas = sorted({_get_team(i["fields"]) for i in done_issues + open_issues} - {"—"})
+
     return {
         "responsavel": display_name,
+        "celulas": celulas,
         "periodo_dias": days,
         "concluidas": len(done_issues),
         "story_points_entregues": done_pts,
         "em_aberto": len(open_issues),
         "story_points_em_aberto": open_pts,
-        "issues_concluidas": [i["key"] for i in done_issues],
-        "issues_em_aberto": [i["key"] for i in open_issues],
+        "issues_concluidas": [{"key": i["key"], "celula": _get_team(i["fields"])} for i in done_issues],
+        "issues_em_aberto":  [{"key": i["key"], "celula": _get_team(i["fields"])} for i in open_issues],
     }
 
 
@@ -1148,6 +1177,7 @@ def free_query(jql: str,
             "resumo":     f.get("summary", ""),
             "status":     f.get("status", {}).get("name", ""),
             "responsavel": (f.get("assignee") or {}).get("displayName", "—"),
+            "celula":     _get_team(f),
             "prioridade": (f.get("priority") or {}).get("name", "—"),
             "tipo":       (f.get("issuetype") or {}).get("name", ""),
         })
